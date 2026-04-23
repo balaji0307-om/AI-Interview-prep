@@ -1,0 +1,23 @@
+{% extends "base.html" %}
+{% block title %}Sign Up | AI Interview Prep{% endblock %}
+{% block content %}
+<section class="auth-layout reverse">
+    <form class="auth-card" method="POST">
+        <p class="eyebrow">New challenger</p>
+        <h1>Create your prep profile.</h1>
+        <label>
+            Username
+            <input name="username" placeholder="Pick a username" required>
+        </label>
+        <label>
+            Password
+            <input name="password" type="password" placeholder="Pick a password" required>
+        </label>
+        <button class="button primary full" type="submit">Create account</button>
+        <p class="form-note">Already have one? <a href="{{ url_for('login') }}">Log in</a></p>
+    </form>
+    <div class="auth-art">
+        <img src="https://images.unsplash.com/photo-1522202176988-66273c2fd55f?auto=format&fit=crop&w=900&q=80" alt="Students studying with laptops">
+    </div>
+</section>
+{% endblock %}

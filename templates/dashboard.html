@@ -1,0 +1,61 @@
+{% extends "base.html" %}
+{% block title %}Dashboard | AI Interview Prep{% endblock %}
+{% block content %}
+<section class="dashboard-hero">
+    <div>
+        <p class="eyebrow">Command center</p>
+        <h1>Welcome, {{ user }}.</h1>
+        <p>Choose topic and mode. MCQ and Coding are both powered by AI-generated practice questions.</p>
+    </div>
+    <div class="stat-row">
+        <div class="stat">
+            <span>Current score</span>
+            <strong>{{ score }}</strong>
+        </div>
+        <div class="stat">
+            <span>Best run</span>
+            <strong>{{ best_score }}</strong>
+        </div>
+        <div class="stat">
+            <span>Saved runs</span>
+            <strong>{{ sessions_played }}</strong>
+        </div>
+    </div>
+</section>
+
+<section class="section-heading">
+    <p class="eyebrow">Practice</p>
+    <h2>Pick your topic and mode</h2>
+</section>
+
+<section class="status-strip">
+    <span>MongoDB: <strong>{{ "Connected" if mongo_status == "connected" else "Not connected" }}</strong></span>
+    <span>Gemini API: <strong>{{ "Connected" if gemini_status == "connected" else "Not connected" }}</strong></span>
+</section>
+
+<section class="topic-grid">
+    {% for slug, topic in topics.items() %}
+        <article class="topic-card {{ topic.accent }}">
+            <span class="topic-badge">{{ loop.index }}</span>
+            <h3>{{ topic.name }}</h3>
+            <p>{{ topic.description }}</p>
+            <div class="topic-actions">
+                <a class="button secondary" href="{{ url_for('practice', topic=slug, mode='mcq') }}">MCQ</a>
+                <a class="button primary" href="{{ url_for('practice', topic=slug, mode='coding') }}">Coding</a>
+            </div>
+        </article>
+    {% endfor %}
+</section>
+
+<section class="platform-strip">
+    <div>
+        <p class="eyebrow">Outside drills</p>
+        <h2>Keep the pressure on</h2>
+    </div>
+    <div class="platform-links">
+        <a href="https://leetcode.com" target="_blank" rel="noreferrer">LeetCode</a>
+        <a href="https://hackerrank.com" target="_blank" rel="noreferrer">HackerRank</a>
+        <a href="https://geeksforgeeks.org" target="_blank" rel="noreferrer">GeeksforGeeks</a>
+    </div>
+</section>
+{% endblock %}

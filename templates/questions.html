@@ -1,0 +1,55 @@
+{% extends "base.html" %}
+{% block title %}{{ topic_meta.name }} {{ mode_label }} | AI Interview Prep{% endblock %}
+{% block content %}
+<section class="question-layout">
+    <aside class="round-panel">
+        <p class="eyebrow">Battle zone</p>
+        <h1>{{ topic_meta.name }}</h1>
+        <p>{{ topic_meta.description }}</p>
+
+        <div class="mode-switch">
+            {% for mode_key, label in modes.items() %}
+                <a class="mode-pill {% if mode_key == mode %}active{% endif %}" href="{{ url_for('practice', topic=topic, mode=mode_key) }}">{{ label }}</a>
+            {% endfor %}
+        </div>
+
+        <div class="meter">
+            <span></span>
+        </div>
+        <small>Question {{ (q.position or 0) + 1 }} of {{ q.pool_size or 120 }}</small>
+        <small>Practice bank: up to 120 questions in this section, from basic to advanced.</small>
+    </aside>
+
+    <form class="question-card" method="POST">
+        <input type="hidden" name="question_id" value="{{ q.id if q.id else '' }}">
+
+        {% if mode == 'mcq' %}
+            <p class="eyebrow">{{ mode_label }} Question</p>
+            <h2>{{ q.question }}</h2>
+
+            <div class="options-grid">
+                {% for opt in q.options %}
+                    <label class="option-card">
+                        <input type="radio" name="answer" value="{{ opt }}" required>
+                        <span class="option-letter">{{ "ABCD"[loop.index0] }}</span>
+                        <span>{{ opt }}</span>
+                    </label>
+                {% endfor %}
+            </div>
+
+            <button class="button primary full" type="submit">Lock answer</button>
+        {% else %}
+            <p class="eyebrow">{{ mode_label }} Question</p>
+            <h2>{{ q.question }}</h2>
+            <div class="coding-meta">
+                <p><strong>Constraints:</strong> {{ q.constraints }}</p>
+                <p><strong>Sample input:</strong> <code>{{ q.sample_input }}</code></p>
+                <p><strong>Sample output:</strong> <code>{{ q.sample_output }}</code></p>
+            </div>
+            <label class="coding-label" for="coding_answer">Write your approach / code</label>
+            <textarea id="coding_answer" name="coding_answer" class="coding-answer" placeholder="Explain your algorithm, edge cases, and complexity..." required></textarea>
+            <button class="button primary full" type="submit">Submit coding answer</button>
+        {% endif %}
+    </form>
+</section>
+{% endblock %}

@@ -1,0 +1,23 @@
+{% extends "base.html" %}
+{% block title %}Login | AI Interview Prep{% endblock %}
+{% block content %}
+<section class="auth-layout">
+    <div class="auth-art">
+        <img src="https://images.unsplash.com/photo-1552664730-d307ca884978?auto=format&fit=crop&w=900&q=80" alt="Team preparing for an interview">
+    </div>
+    <form class="auth-card" method="POST">
+        <p class="eyebrow">Welcome back</p>
+        <h1>Log in and start your next run.</h1>
+        <label>
+            Username
+            <input name="username" placeholder="Your username" required>
+        </label>
+        <label>
+            Password
+            <input name="password" type="password" placeholder="Your password" required>
+        </label>
+        <button class="button primary full" type="submit">Login</button>
+        <p class="form-note">New here? <a href="{{ url_for('signup') }}">Create an account</a></p>
+    </form>
+</section>
+{% endblock %}

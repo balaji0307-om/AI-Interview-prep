@@ -1,0 +1,29 @@
+{% extends "base.html" %}
+{% block title %}Leaderboard | AI Interview Prep{% endblock %}
+{% block content %}
+<section class="leaderboard">
+    <div class="section-heading">
+        <p class="eyebrow">Hall of heat</p>
+        <h1>Leaderboard</h1>
+    </div>
+
+    <div class="leaderboard-list">
+        {% if data %}
+            {% for user, score in data %}
+                <div class="leader-row">
+                    <span class="rank">#{{ loop.index }}</span>
+                    <strong>{{ user }}</strong>
+                    <span>{{ score }} pts</span>
+                </div>
+            {% endfor %}
+        {% else %}
+            <div class="empty-state">
+                <h2>No saved runs yet.</h2>
+                <p>Finish a round and claim the first spot.</p>
+            </div>
+        {% endif %}
+    </div>
+
+    <a class="button secondary" href="{{ url_for('dashboard') }}">Back to dashboard</a>
+</section>
+{% endblock %}

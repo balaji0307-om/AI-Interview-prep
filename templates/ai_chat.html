@@ -1,0 +1,35 @@
+{% extends "base.html" %}
+{% block title %}AI Chatbot | AI Interview Prep{% endblock %}
+{% block content %}
+<section class="chat-shell">
+    <div class="chat-head">
+        <p class="eyebrow">AI Mentor</p>
+        <h1>Ask anything about interview prep</h1>
+        <p>Gemini will answer questions and use your recent attempts for contextual guidance.</p>
+    </div>
+
+    <div class="chat-log">
+        {% if chat_history %}
+            {% for item in chat_history %}
+                <article class="chat-bubble user">
+                    <p class="bubble-label">You</p>
+                    <p>{{ item.user_message }}</p>
+                </article>
+                <article class="chat-bubble bot">
+                    <p class="bubble-label">AI</p>
+                    <p>{{ item.assistant_message }}</p>
+                </article>
+            {% endfor %}
+        {% else %}
+            <article class="chat-empty">
+                <p>No chat yet. Ask your first question.</p>
+            </article>
+        {% endif %}
+    </div>
+
+    <form class="chat-form" method="POST">
+        <textarea name="message" placeholder="Example: Explain two-pointer technique with interview examples" required></textarea>
+        <button class="button primary" type="submit">Send</button>
+    </form>
+</section>
+{% endblock %}

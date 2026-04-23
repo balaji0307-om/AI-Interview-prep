@@ -1,0 +1,40 @@
+{% extends "base.html" %}
+{% block title %}Round Result | AI Interview Prep{% endblock %}
+{% block content %}
+<section class="result-stage {% if is_correct %}win{% else %}miss{% endif %}">
+    <p class="eyebrow">{{ topic_name }} - {{ mode_label }} result</p>
+    {% if is_correct %}
+        <h1>Correct. Clean hit.</h1>
+        <p>Your answer landed. Keep the streak alive.</p>
+    {% else %}
+        <h1>Not this one.</h1>
+        {% if mode == 'mcq' %}
+            <p>The correct answer was <strong>{{ correct }}</strong>.</p>
+        {% else %}
+            <p>Your coding answer needs refinement.</p>
+        {% endif %}
+    {% endif %}
+
+    <p class="result-feedback">{{ feedback }}</p>
+
+    <div class="score-orbit">
+        <span>Score</span>
+        <strong>{{ score }}</strong>
+    </div>
+
+    {% if not is_correct %}
+        <button class="button secondary" type="button" data-toggle-solution>View solution</button>
+        <div class="solution-panel" hidden>
+            {% if expected_approach %}
+                <p><strong>Expected approach:</strong> {{ expected_approach }}</p>
+            {% endif %}
+            <p><strong>Solution:</strong> {{ solution }}</p>
+        </div>
+    {% endif %}
+
+    <div class="hero-actions">
+        <a class="button primary" href="{{ url_for('practice', topic=topic, mode=mode) }}">Next question</a>
+        <a class="button secondary" href="{{ url_for('save_score') }}">Save run</a>
+    </div>
+</section>
+{% endblock %}

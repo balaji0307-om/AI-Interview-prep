@@ -1,0 +1,44 @@
+{% extends "base.html" %}
+{% block title %}AI Interview Prep{% endblock %}
+{% block content %}
+<section class="hero">
+    <div class="hero-copy">
+        <p class="eyebrow">AI powered interview reps</p>
+        <h1>Turn your prep into a high-pressure practice arena.</h1>
+        <p class="hero-text">Pick a topic, answer live MCQs, build a streak, and save your best score to the leaderboard.</p>
+        <div class="hero-actions">
+            <a class="button primary" href="{{ url_for('signup') }}">Enter the arena</a>
+            <a class="button secondary" href="{{ url_for('login') }}">I already train here</a>
+        </div>
+    </div>
+    <div class="hero-visual" aria-label="Interview prep workspace">
+        <img src="https://images.unsplash.com/photo-1516321318423-f06f85e504b3?auto=format&fit=crop&w=900&q=80" alt="Laptop with learning workspace">
+        <div class="floating-panel panel-one">
+            <span>Focus</span>
+            <strong>92%</strong>
+        </div>
+        <div class="floating-panel panel-two">
+            <span>Next round</span>
+            <strong>DSA</strong>
+        </div>
+    </div>
+</section>
+
+<section class="feature-grid">
+    <article>
+        <span>01</span>
+        <h2>Live AI questions</h2>
+        <p>Fresh prompts keep each round unpredictable and useful.</p>
+    </article>
+    <article>
+        <span>02</span>
+        <h2>Topic battles</h2>
+        <p>Python, Java, C++, and DSA are ready for focused practice.</p>
+    </article>
+    <article>
+        <span>03</span>
+        <h2>Score pressure</h2>
+        <p>Save your run, chase your best, and climb the board.</p>
+    </article>
+</section>
+{% endblock %}
