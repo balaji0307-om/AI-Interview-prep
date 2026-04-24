@@ -1,0 +1,52 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+}
+
+body {
+  @apply min-h-screen bg-slate-950 text-slate-100 antialiased;
+  background:
+    radial-gradient(circle at 12% 18%, rgba(94, 234, 212, 0.16), transparent 22%),
+    radial-gradient(circle at 88% 16%, rgba(251, 113, 133, 0.14), transparent 24%),
+    radial-gradient(circle at 68% 88%, rgba(96, 165, 250, 0.12), transparent 20%),
+    #020817;
+}
+
+#root {
+  @apply min-h-screen;
+}
+
+@layer components {
+  .glass-panel {
+    @apply rounded-[28px] border border-white/10 bg-slate-900/70 shadow-atmospheric backdrop-blur;
+  }
+
+  .action-btn {
+    @apply inline-flex items-center justify-center rounded-full border border-white/10 bg-white/5 px-4 py-2 text-sm font-semibold text-slate-100 transition hover:border-cyan/60 hover:bg-cyan/10;
+  }
+
+  .action-btn-primary {
+    @apply inline-flex items-center justify-center rounded-full bg-cyan px-5 py-3 text-sm font-bold uppercase tracking-[0.18em] text-slate-950 transition hover:bg-cyan/90;
+  }
+
+  .input-shell {
+    @apply w-full rounded-2xl border border-white/10 bg-slate-950/70 px-4 py-3 text-sm text-slate-100 outline-none transition placeholder:text-slate-500 focus:border-cyan/70 focus:ring-2 focus:ring-cyan/20;
+  }
+
+  .soft-label {
+    @apply text-[11px] font-semibold uppercase tracking-[0.24em] text-slate-400;
+  }
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(148, 163, 184, 0.3);
+  border-radius: 9999px;
+}

@@ -1,49 +1,32 @@
 from __future__ import annotations
 
-import json
-import os
-import re
 import hashlib
+import json
+import re
 import secrets
-import sqlite3
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, Header, HTTPException, Query
+from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
-from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from pydantic import BaseModel, Field
+from sqlalchemy import delete, desc, func, select
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
+
+from database import Base, SessionLocal, database_label, engine, get_db
+from llm_provider import LLMUnavailableError, default_provider_name, generate_text, provider_status
+from models import Attempt, ChatLog, Question, User
 from question_bank import QUESTION_BANK_SIZE, build_coding_questions, build_mcq_questions, extract_question_sequence
 
-try:
-    from pymongo import MongoClient
-except ModuleNotFoundError:
-    MongoClient = None
-
-try:
-    from bson import ObjectId
-except ModuleNotFoundError:
-    ObjectId = None
-
-try:
-    import google.generativeai as genai
-except ModuleNotFoundError:
-    genai = None
 
 BASE_DIR = Path(__file__).resolve().parent
 FRONTEND_DIR = BASE_DIR / "frontend"
-DB_PATH = BASE_DIR / "users.db"
-
-MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
-MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "interview_prep")
-DEFAULT_GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+FRONTEND_DIST_DIR = FRONTEND_DIR / "dist"
 QUESTION_TARGET = QUESTION_BANK_SIZE
-QUESTION_READY_MINIMUM = 10
-QUESTION_BANK_SOURCE = "question-bank-v2"
-FALLBACK_GEMINI_MODELS = ["gemini-2.0-flash", "gemini-2.5-flash", "gemini-1.5-flash"]
+QUESTION_BANK_SOURCE = "question-bank-v3-sqlalchemy"
 CHAT_MAX_OUTPUT_TOKENS = 900
 
 TOPICS = {
@@ -71,16 +54,7 @@ TOPICS = {
 
 MODES = {"mcq": "MCQ", "coding": "Coding"}
 
-MEMORY_STORE: dict[str, Any] = {
-    "questions": {},
-    "attempts": [],
-    "chat_logs": [],
-}
-
-app = FastAPI(title="Interview Prep FastAPI")
-app.state.last_gemini_error = ""
-app.state.discovered_models = None
-
+app = FastAPI(title="Interview Prep AI Stack")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -102,45 +76,28 @@ class AuthRequest(BaseModel):
 
 
 class SubmitAttemptRequest(BaseModel):
-    user_id: str = "local-user"
+    user_id: str
     topic: str
     mode: str
     question_id: str
     answer: str
+    provider: str | None = None
 
 
 class ChatRequest(BaseModel):
-    user_id: str = "local-user"
+    user_id: str
     message: str
     topic: str | None = None
     mode: str | None = None
+    provider: str | None = None
 
 
 class ClearChatRequest(BaseModel):
-    user_id: str = "local-user"
+    user_id: str
 
 
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
-
-
-def setup_auth_db():
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS users (
-                username TEXT UNIQUE,
-                password TEXT,
-                created_at TEXT,
-                last_login_at TEXT
-            )
-            """
-        )
-        columns = {row[1] for row in conn.execute("PRAGMA table_info(users)").fetchall()}
-        if "created_at" not in columns:
-            conn.execute("ALTER TABLE users ADD COLUMN created_at TEXT")
-        if "last_login_at" not in columns:
-            conn.execute("ALTER TABLE users ADD COLUMN last_login_at TEXT")
 
 
 def hash_password(password: str, salt: str | None = None) -> str:
@@ -150,7 +107,8 @@ def hash_password(password: str, salt: str | None = None) -> str:
 
 
 def verify_password(password: str, stored_password: str) -> bool:
-    stored_password = stored_password or ""
+    if not stored_password:
+        return False
     if stored_password.startswith("pbkdf2_sha256$"):
         try:
             _, salt, expected = stored_password.split("$", 2)
@@ -158,8 +116,6 @@ def verify_password(password: str, stored_password: str) -> bool:
             return False
         candidate = hash_password(password, salt).split("$", 2)[2]
         return secrets.compare_digest(candidate, expected)
-
-    # Backward compatibility with old local demo accounts stored as plain text.
     return secrets.compare_digest(password, stored_password)
 
 
@@ -167,67 +123,8 @@ def normalize_username(username: str) -> str:
     return re.sub(r"\s+", "", username.strip().lower())
 
 
-def auth_response(username: str) -> dict[str, str]:
-    return {"user_id": username, "username": username}
-
-
-setup_auth_db()
-
-
-def fetch_user(username: str) -> tuple[str, str] | None:
-    with sqlite3.connect(DB_PATH) as conn:
-        row = conn.execute(
-            "SELECT username, password FROM users WHERE username = ?",
-            (username,),
-        ).fetchone()
-    if not row:
-        return None
-    return row[0], row[1]
-
-
-def create_user(username: str, password: str) -> dict[str, str]:
-    normalized = normalize_username(username)
-    if not re.fullmatch(r"[a-z0-9_]{3,40}", normalized):
-        raise HTTPException(
-            status_code=400,
-            detail="Username must be 3-40 characters using letters, numbers, or underscore.",
-        )
-
-    if len(password.strip()) < 4:
-        raise HTTPException(status_code=400, detail="Password must be at least 4 characters.")
-
-    timestamp = utc_now().isoformat()
-    hashed_password = hash_password(password)
-
-    try:
-        with sqlite3.connect(DB_PATH) as conn:
-            conn.execute(
-                "INSERT INTO users (username, password, created_at, last_login_at) VALUES (?, ?, ?, ?)",
-                (normalized, hashed_password, timestamp, None),
-            )
-    except sqlite3.IntegrityError:
-        raise HTTPException(status_code=409, detail="Account already exists. Use login instead.")
-
-    return auth_response(normalized)
-
-
-def login_user(username: str, password: str) -> dict[str, str]:
-    normalized = normalize_username(username)
-    user_row = fetch_user(normalized)
-    if not user_row:
-        raise HTTPException(status_code=404, detail="Account not found. Sign up first.")
-
-    stored_username, stored_password = user_row
-    if not verify_password(password, stored_password):
-        raise HTTPException(status_code=401, detail="Incorrect password.")
-
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute(
-            "UPDATE users SET last_login_at = ? WHERE username = ?",
-            (utc_now().isoformat(), stored_username),
-        )
-
-    return auth_response(stored_username)
+def auth_response(user: User) -> dict[str, str]:
+    return {"user_id": str(user.id), "username": user.username}
 
 
 def parse_json_from_text(text: str) -> Any:
@@ -236,8 +133,8 @@ def parse_json_from_text(text: str) -> Any:
         raise ValueError("Empty response")
 
     if cleaned.startswith("```"):
-        cleaned = re.sub(r"^```(?:json)?\\s*", "", cleaned, flags=re.IGNORECASE)
-        cleaned = re.sub(r"\\s*```$", "", cleaned)
+        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\s*```$", "", cleaned)
 
     try:
         return json.loads(cleaned)
@@ -245,9 +142,9 @@ def parse_json_from_text(text: str) -> Any:
         pass
 
     for pattern in (r"\[[\s\S]*\]", r"\{[\s\S]*\}"):
-        m = re.search(pattern, cleaned)
-        if m:
-            return json.loads(m.group(0))
+        match = re.search(pattern, cleaned)
+        if match:
+            return json.loads(match.group(0))
 
     raise ValueError("No valid JSON in model response")
 
@@ -257,132 +154,43 @@ def normalize_chat_answer(value: Any) -> str:
     if not text:
         return ""
 
-    # Handle fenced output like ```json ... ```
     if text.startswith("```"):
         text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
         text = re.sub(r"\s*```$", "", text).strip()
 
-    # Remove rigid section labels for cleaner conversational rendering.
-    text = re.sub(r"(?i)\bDirect Answer\s*:\s*", "", text)
-
-    # If response is a JSON object string, extract `answer`.
     try:
         parsed = json.loads(text)
         if isinstance(parsed, dict) and "answer" in parsed:
             return str(parsed.get("answer", "")).strip()
-        if isinstance(parsed, dict) and any(k in parsed for k in ["direct_answer", "core_concept", "example", "common_mistakes", "when_to_use"]):
+        if isinstance(parsed, dict) and any(
+            key in parsed for key in ("direct_answer", "core_concept", "example", "common_mistakes", "when_to_use")
+        ):
             return compose_structured_answer(parsed)
     except Exception:
         pass
 
-    # Recover when Gemini returns an incomplete JSON envelope like:
-    # {"answer":"...","related_suggestions":[...]
     if re.match(r"^\s*\{", text) and '"answer"' in text:
-        m = re.search(r'"answer"\s*:\s*"([\s\S]*)', text)
-        if m:
-            answer_text = m.group(1)
+        match = re.search(r'"answer"\s*:\s*"([\s\S]*)', text)
+        if match:
+            answer_text = match.group(1)
             answer_text = re.split(r'"\s*,\s*"related_suggestions"\s*:', answer_text, maxsplit=1)[0]
             answer_text = re.sub(r'"\s*}\s*$', "", answer_text).strip()
             answer_text = answer_text.replace("\\n", "\n").replace('\\"', '"').replace("\\t", "    ")
             if answer_text:
                 return normalize_chat_answer(answer_text)
 
-    # Recover structured fields even if JSON is partially malformed/truncated.
     recovered = {}
-    for key in ["direct_answer", "core_concept", "example", "common_mistakes", "when_to_use", "answer"]:
+    for key in ("direct_answer", "core_concept", "example", "common_mistakes", "when_to_use", "answer"):
         pattern = rf'"{key}"\s*:\s*"([\s\S]*?)"(?=,\s*"[a-z_]+"|\s*}}|$)'
-        m = re.search(pattern, text)
-        if m:
-            recovered[key] = m.group(1).replace('\\"', '"').strip()
+        match = re.search(pattern, text)
+        if match:
+            recovered[key] = match.group(1).replace('\\"', '"').strip()
     if recovered:
         if "answer" in recovered:
             return recovered["answer"]
         return compose_structured_answer(recovered)
 
     return text
-
-
-def build_related_suggestions(question: str, answer: str = "") -> list[str]:
-    source = f"{question} {answer}".lower()
-    rules = [
-        (["array", "list"], ["Show array implementation in C++.", "Compare array vs linked list.", "Give an array interview problem."]),
-        (["pointer", "reference", "memory"], ["Show pointer example in C++.", "Explain pointer vs reference.", "Explain dangling and null pointers."]),
-        (["linked list", "node"], ["Show linked list code.", "Compare linked list vs array.", "Explain linked list time complexity."]),
-        (["stack"], ["Show stack implementation.", "Explain stack applications.", "Give a stack interview problem."]),
-        (["queue"], ["Show queue implementation.", "Explain queue vs stack.", "Give a queue interview problem."]),
-        (["tree", "bst", "binary"], ["Explain tree traversal.", "Show binary tree code.", "Give a tree interview problem."]),
-        (["graph"], ["Explain BFS and DFS.", "Show graph representation.", "Give a graph interview problem."]),
-        (["dp", "dynamic programming"], ["Explain DP with an example.", "Show memoization vs tabulation.", "Give a beginner DP problem."]),
-        (["python"], ["Show Python code example.", "Explain Python-specific mistakes.", "Give Python interview questions."]),
-        (["java"], ["Show Java code example.", "Explain Java memory basics.", "Give Java interview questions."]),
-        (["c++", "cpp"], ["Show C++ code example.", "Explain C++ memory handling.", "Give C++ interview questions."]),
-    ]
-    for keywords, suggestions in rules:
-        if any(keyword in source for keyword in keywords):
-            return suggestions
-    return [
-        "Show a simple code example.",
-        "Explain with a dry run.",
-        "Give an interview question on this.",
-    ]
-
-
-def use_local_suggestions(suggestions: list[str]) -> bool:
-    if len(suggestions) < 2:
-        return True
-    joined = " ".join(suggestions).lower()
-    generic_markers = [
-        "show a code example for this",
-        "explain time and space complexity",
-        "ask again",
-    ]
-    return any(marker in joined for marker in generic_markers)
-
-
-def configure_genai(api_key: str) -> bool:
-    if not (genai and api_key):
-        return False
-    try:
-        genai.configure(api_key=api_key)
-        return True
-    except Exception:
-        return False
-
-
-def resolve_gemini_key(header_key: str | None) -> str:
-    if header_key and header_key.strip():
-        return header_key.strip()
-    return os.getenv("GEMINI_API_KEY", "").strip()
-
-
-def unique_keep_order(items: list[str]) -> list[str]:
-    seen = set()
-    out = []
-    for item in items:
-        val = (item or "").strip()
-        if not val or val in seen:
-            continue
-        seen.add(val)
-        out.append(val)
-    return out
-
-
-def discover_generate_models() -> list[str]:
-    names = []
-    try:
-        for model in genai.list_models():
-            supported = getattr(model, "supported_generation_methods", []) or []
-            if "generateContent" not in supported:
-                continue
-            name = getattr(model, "name", "")
-            if not name:
-                continue
-            if name.startswith("models/"):
-                name = name.split("/", 1)[1]
-            names.append(name)
-    except Exception:
-        return []
-    return names
 
 
 def compose_structured_answer(payload: dict[str, Any]) -> str:
@@ -403,37 +211,126 @@ def compose_structured_answer(payload: dict[str, Any]) -> str:
     return "\n\n".join(lines).strip()
 
 
+def extract_primary_chat_query(question: str) -> str:
+    lines = [line.strip() for line in str(question or "").splitlines() if line.strip()]
+    if not lines:
+        return ""
+
+    first_line = lines[0]
+    strong_topic_keywords = [
+        "pointer",
+        "reference",
+        "linked list",
+        "stack",
+        "queue",
+        "tree",
+        "graph",
+        "array",
+        "recursion",
+        "heap",
+        "hash",
+        "binary search",
+        "oop",
+        "class",
+    ]
+    first_lower = first_line.lower()
+    if any(keyword in first_lower for keyword in strong_topic_keywords):
+        return first_line
+
+    collected = []
+    for line in lines:
+        lower = line.lower()
+        if re.match(r"^(def |class |#include|int main|public:|private:|protected:)", line):
+            break
+        if lower == "chatbot fix":
+            break
+        collected.append(line)
+        if len(" ".join(collected)) >= 220:
+            break
+
+    return " ".join(collected).strip() or first_line
+
+
+def prefer_local_chat_answer(question: str) -> bool:
+    primary = extract_primary_chat_query(question).lower()
+    if not primary:
+        return False
+    topics = ["pointer", "reference", "linked list", "stack", "queue", "tree", "graph", "array"]
+    return len(primary.split()) <= 24 and any(topic in primary for topic in topics)
+
+
+def build_related_suggestions(question: str, answer: str = "") -> list[str]:
+    question_source = str(question or "").lower()
+    answer_source = str(answer or "").lower()
+    rules = [
+        (["pointer", "reference", "memory"], ["Show pointer example in C++.", "Explain pointer vs reference.", "Explain dangling and null pointers."]),
+        (["array", "list"], ["Show array implementation in C++.", "Compare array vs linked list.", "Give an array interview problem."]),
+        (["linked list", "node"], ["Show linked list code.", "Compare linked list vs array.", "Explain linked list time complexity."]),
+        (["stack"], ["Show stack implementation.", "Explain stack applications.", "Give a stack interview problem."]),
+        (["queue"], ["Show queue implementation.", "Explain queue vs stack.", "Give a queue interview problem."]),
+        (["tree", "bst", "binary"], ["Explain tree traversal.", "Show binary tree code.", "Give a tree interview problem."]),
+        (["graph"], ["Explain BFS and DFS.", "Show graph representation.", "Give a graph interview problem."]),
+        (["dp", "dynamic programming"], ["Explain DP with an example.", "Show memoization vs tabulation.", "Give a beginner DP problem."]),
+        (["python"], ["Show Python code example.", "Explain Python-specific mistakes.", "Give Python interview questions."]),
+        (["java"], ["Show Java code example.", "Explain Java memory basics.", "Give Java interview questions."]),
+        (["c++", "cpp"], ["Show C++ code example.", "Explain C++ memory handling.", "Give C++ interview questions."]),
+    ]
+    for keywords, suggestions in rules:
+        if any(keyword in question_source for keyword in keywords):
+            return suggestions
+    for keywords, suggestions in rules:
+        if any(keyword in answer_source for keyword in keywords):
+            return suggestions
+    return [
+        "Show a simple code example.",
+        "Explain with a dry run.",
+        "Give an interview question on this.",
+    ]
+
+
+def use_local_suggestions(suggestions: list[str]) -> bool:
+    if len(suggestions) < 2:
+        return True
+    joined = " ".join(suggestions).lower()
+    generic_markers = [
+        "show a code example for this",
+        "explain time and space complexity",
+        "ask again",
+    ]
+    return any(marker in joined for marker in generic_markers)
+
+
 def build_local_structured_answer(question: str) -> str:
-    q = (question or "").strip()
+    q = extract_primary_chat_query(question)
     lower = q.lower()
 
     if "linked list" in lower:
         payload = {
             "direct_answer": "A linked list is a linear data structure where each node stores data and a reference to the next node instead of using contiguous memory like an array.",
-            "core_concept": "Main types: singly linked list (next pointer only), doubly linked list (prev and next), circular singly linked list (last node points to first), and circular doubly linked list (both directions plus circular links). Insertion or deletion at a known node is O(1), but searching is O(n).",
-            "example": "Example: 10 -> 20 -> 30 -> null is a singly linked list. If you insert 15 after 10, it becomes 10 -> 15 -> 20 -> 30 by changing pointers instead of shifting all elements.",
-            "common_mistakes": "Forgetting to update links in the correct order, losing the head pointer, not handling empty or single-node lists, and assuming linked lists support O(1) random access like arrays.",
-            "when_to_use": "Use a linked list when you need frequent insertions or deletions in the middle or front and do not need fast index-based access.",
+            "core_concept": "Main types: singly linked list, doubly linked list, circular singly linked list, and circular doubly linked list. Insertion or deletion at a known node is O(1), but searching is O(n).",
+            "example": "Example: 10 -> 20 -> 30 -> null is a singly linked list. If you insert 15 after 10, it becomes 10 -> 15 -> 20 -> 30.",
+            "common_mistakes": "Forgetting to update links in the correct order, losing the head pointer, and assuming linked lists support O(1) random access like arrays.",
+            "when_to_use": "Use a linked list when you need frequent insertions or deletions and do not need fast index-based access.",
         }
         return compose_structured_answer(payload)
 
     if "stack" in lower:
         payload = {
             "direct_answer": "A stack is a linear data structure that follows LIFO: Last In, First Out.",
-            "core_concept": "Main operations are push, pop, peek/top, and isEmpty. Push and pop are usually O(1). Common implementations use arrays/lists or linked lists.",
+            "core_concept": "Main operations are push, pop, peek/top, and isEmpty. Push and pop are usually O(1).",
             "example": "If you push 10, 20, 30, the top is 30. One pop removes 30 first, then 20 becomes the new top.",
-            "common_mistakes": "Popping from an empty stack, confusing stack order with queue order, and forgetting that recursion also uses an implicit call stack.",
-            "when_to_use": "Use a stack for expression evaluation, undo operations, backtracking, DFS, balanced parentheses, and function-call style behavior.",
+            "common_mistakes": "Popping from an empty stack, confusing stack order with queue order, and forgetting recursion uses an implicit call stack.",
+            "when_to_use": "Use a stack for expression evaluation, undo operations, DFS, and balanced-parentheses problems.",
         }
         return compose_structured_answer(payload)
 
     if "queue" in lower:
         payload = {
             "direct_answer": "A queue is a linear data structure that follows FIFO: First In, First Out.",
-            "core_concept": "Main operations are enqueue, dequeue, front/peek, and isEmpty. Enqueue and dequeue are usually O(1) in a proper implementation.",
+            "core_concept": "Main operations are enqueue, dequeue, front/peek, and isEmpty. Enqueue and dequeue are usually O(1).",
             "example": "If you enqueue 10, 20, 30, the first dequeue removes 10, then 20 becomes the front.",
-            "common_mistakes": "Confusing queue behavior with stack behavior, using a slow array implementation that shifts elements, and not handling empty queue cases.",
-            "when_to_use": "Use a queue in BFS traversal, scheduling, buffering, producer-consumer systems, and any problem where arrival order matters.",
+            "common_mistakes": "Confusing queue behavior with stack behavior and using slow implementations that shift every remaining element.",
+            "when_to_use": "Use a queue in BFS traversal, scheduling, buffering, and producer-consumer systems.",
         }
         return compose_structured_answer(payload)
 
@@ -443,37 +340,37 @@ def build_local_structured_answer(question: str) -> str:
             "core_concept": "Common types include binary tree, binary search tree, AVL tree, heap, and trie. Important terms are root, parent, child, leaf, height, and subtree.",
             "example": "In a binary tree, node 10 can have left child 5 and right child 15. Traversals include preorder, inorder, postorder, and level order.",
             "common_mistakes": "Confusing BST rules with general binary trees, missing null/base cases in recursion, and mixing up traversal orders.",
-            "when_to_use": "Use trees for hierarchical data, searching with ordering, expression parsing, file systems, priority handling, and prefix lookup.",
+            "when_to_use": "Use trees for hierarchical data, expression parsing, file systems, prefix lookup, and ordered search structures.",
         }
         return compose_structured_answer(payload)
 
     if "graph" in lower:
         payload = {
-            "direct_answer": "A graph is a set of vertices (nodes) and edges that connect pairs of vertices.",
+            "direct_answer": "A graph is a set of vertices and edges that connect pairs of vertices.",
             "core_concept": "Graphs can be directed or undirected, weighted or unweighted, cyclic or acyclic. Common representations are adjacency list and adjacency matrix.",
-            "example": "If A is connected to B and C, the adjacency list is A:[B,C]. Traversals are BFS and DFS, and shortest-path algorithms include Dijkstra for weighted graphs.",
-            "common_mistakes": "Choosing the wrong representation, not tracking visited nodes, and confusing tree properties with general graph behavior.",
-            "when_to_use": "Use graphs for networks, routes, dependencies, social connections, prerequisites, and state transitions.",
+            "example": "If A is connected to B and C, the adjacency list is A:[B,C]. Traversals are BFS and DFS.",
+            "common_mistakes": "Choosing the wrong representation, not tracking visited nodes, and assuming graph rules behave like tree rules.",
+            "when_to_use": "Use graphs for routes, dependencies, networks, social relationships, and state transitions.",
         }
         return compose_structured_answer(payload)
 
     if "array" in lower:
         payload = {
             "direct_answer": "An array is a linear data structure that stores same-type elements in contiguous memory locations.",
-            "core_concept": "Access is index-based (usually starting at 0), so reading/writing an element by index is O(1). Common types: 1D array and 2D array (matrix).",
-            "example": "Example (Python): arr = [10, 20, 30]. arr[1] gives 20. Example (2D): mat = [[1,2],[3,4]], mat[1][0] gives 3.",
-            "common_mistakes": "Index out of bounds, confusion between 0-based index and position, and assuming fixed-size arrays can grow automatically in all languages.",
+            "core_concept": "Access is index-based, so reading or writing an element by index is O(1). Common forms are 1D arrays and 2D arrays.",
+            "example": "Example: arr = [10, 20, 30], arr[1] gives 20. In C++: int arr[3] = {10, 20, 30};",
+            "common_mistakes": "Index out of bounds, confusing index with position, and assuming fixed-size arrays can grow automatically.",
             "when_to_use": "Use arrays when you need fast index access, predictable memory layout, and ordered elements.",
         }
         return compose_structured_answer(payload)
 
-    if "pointer" in lower:
+    if "pointer" in lower or "reference" in lower:
         payload = {
-            "direct_answer": "A pointer stores the memory address of another variable (common in C/C++).",
-            "core_concept": "Use '&' to get address and '*' to dereference. Example: int x=10; int* p=&x; *p reads/writes x.",
-            "example": "C++: int x=5; int* p=&x; *p=9; // now x becomes 9",
-            "common_mistakes": "Dereferencing null/uninitialized pointers, forgetting memory ownership, and using dangling pointers after free/delete.",
-            "when_to_use": "Use pointers for dynamic memory, linked data structures, pass-by-reference style behavior, and low-level optimization.",
+            "direct_answer": "A pointer stores the memory address of another variable. Common pointer types in C/C++ include null pointer, void pointer, wild or uninitialized pointer, dangling pointer, function pointer, pointer to pointer, pointer to const, and constant pointer.",
+            "core_concept": "Use '&' to get an address and '*' to dereference it. Pointer vs reference: a pointer can be null, reassigned, and needs dereferencing, while a reference is an alias that must be initialized and usually cannot be reseated. A null pointer points to no valid object. A dangling pointer points to memory that has already been deleted or gone out of scope.",
+            "example": "C++ example:\n```cpp\nint x = 5;\nint* p = &x;\ncout << *p << \"\\n\";   // 5\n*p = 9;\ncout << x << \"\\n\";    // 9\n\nint* np = nullptr;\nint** pp = &p;\n```\nThis works because p stores the address of x, so changing *p changes x itself.",
+            "common_mistakes": "Using an uninitialized pointer, dereferencing nullptr, keeping a dangling pointer after delete, and confusing `int* p` with `int &r` because pointers and references are not interchangeable.",
+            "when_to_use": "Use pointers for dynamic memory, arrays and strings in low-level code, linked data structures, callbacks, and memory-oriented systems code. Prefer references when you only need a safer alias.",
         }
         return compose_structured_answer(payload)
 
@@ -482,139 +379,9 @@ def build_local_structured_answer(question: str) -> str:
         "core_concept": "Break the problem into definition, key operations, complexity, and edge cases.",
         "example": "Give one small input/output or code snippet and explain why it works.",
         "common_mistakes": "Typical issues are edge-case misses, wrong complexity assumptions, and off-by-one errors.",
-        "when_to_use": "Choose the concept/approach when it gives correct logic with acceptable time and space complexity.",
+        "when_to_use": "Choose the concept or approach when it gives correct logic with acceptable time and space complexity.",
     }
     return compose_structured_answer(payload)
-
-
-def call_gemini_json(prompt: str, fallback: Any, api_key: str) -> Any:
-    if not configure_genai(api_key):
-        app.state.last_gemini_error = "Gemini is not configured with an API key."
-        return fallback
-
-    model_candidates = unique_keep_order([DEFAULT_GEMINI_MODEL] + FALLBACK_GEMINI_MODELS)
-    last_error = ""
-    should_try_discovery = False
-
-    for model_name in model_candidates:
-        try:
-            def _run_request():
-                model = genai.GenerativeModel(model_name)
-                response = model.generate_content(
-                    prompt,
-                    generation_config={
-                        "temperature": 0.2,
-                        "max_output_tokens": CHAT_MAX_OUTPUT_TOKENS,
-                    },
-                )
-                text = getattr(response, "text", "")
-                try:
-                    return parse_json_from_text(text)
-                except Exception:
-                    # Some Gemini responses are plain text instead of JSON.
-                    # For chat fallback payloads, accept raw text as answer.
-                    if isinstance(fallback, dict) and "answer" in fallback and text.strip():
-                        return {"answer": text.strip()}
-                    raise
-
-            with ThreadPoolExecutor(max_workers=1) as executor:
-                future = executor.submit(_run_request)
-                result = future.result(timeout=12)
-                app.state.last_gemini_error = ""
-                return result
-        except FuturesTimeout:
-            last_error = f"Request timeout on model {model_name}"
-            continue
-        except Exception as exc:
-            error_text = str(exc).lower()
-            last_error = str(exc)
-            if "certificate_verify_failed" in error_text or "certificate is not yet valid" in error_text:
-                app.state.last_gemini_error = "SSL certificate validation failed. Fix system date/time."
-                if isinstance(fallback, dict) and "answer" in fallback:
-                    return {"answer": "Gemini SSL failed because system date/time is incorrect. Fix Windows date/time and restart backend."}
-                return fallback
-            if "model" in error_text or "not found" in error_text or "permission" in error_text:
-                should_try_discovery = True
-                continue
-            break
-
-    # Expensive discovery is attempted only when model name/access errors happen.
-    if should_try_discovery:
-        discovered = app.state.discovered_models
-        if discovered is None:
-            discovered = discover_generate_models()
-            app.state.discovered_models = discovered
-        discovered_candidates = unique_keep_order(discovered)
-        for model_name in discovered_candidates:
-            if model_name in model_candidates:
-                continue
-            try:
-                def _run_request_discovered():
-                    model = genai.GenerativeModel(model_name)
-                    response = model.generate_content(
-                        prompt,
-                        generation_config={
-                            "temperature": 0.2,
-                            "max_output_tokens": CHAT_MAX_OUTPUT_TOKENS,
-                        },
-                    )
-                    text = getattr(response, "text", "")
-                    try:
-                        return parse_json_from_text(text)
-                    except Exception:
-                        if isinstance(fallback, dict) and "answer" in fallback and text.strip():
-                            return {"answer": text.strip()}
-                        raise
-
-                with ThreadPoolExecutor(max_workers=1) as executor:
-                    future = executor.submit(_run_request_discovered)
-                    result = future.result(timeout=12)
-                    app.state.last_gemini_error = ""
-                    return result
-            except Exception as exc:
-                last_error = str(exc)
-                continue
-
-    app.state.last_gemini_error = last_error or "Unknown Gemini request error"
-    if isinstance(fallback, dict) and "answer" in fallback:
-        return {"answer": f"Gemini request failed: {app.state.last_gemini_error}"}
-    return fallback
-
-
-def get_mongo_db():
-    if MongoClient is None:
-        return None
-    try:
-        client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=1500)
-        client.admin.command("ping")
-        db = client[MONGO_DB_NAME]
-        db["ai_questions"].create_index(
-            [("topic", 1), ("mode", 1), ("question", 1)],
-            unique=True,
-            name="topic_mode_question_unique",
-        )
-        db["chat_logs"].create_index([("user_id", 1), ("created_at", -1)], name="chat_user_time")
-        db["attempts"].create_index([("user_id", 1), ("created_at", -1)], name="attempt_user_time")
-        return db
-    except Exception:
-        return None
-
-
-def fallback_mcq(topic_name: str, count: int) -> list[dict[str, Any]]:
-    topic_key = next((key for key, meta in TOPICS.items() if meta["name"] == topic_name), "dsa")
-    return build_mcq_questions(topic_key, count)
-
-
-def fallback_coding(topic_name: str, count: int) -> list[dict[str, Any]]:
-    topic_key = next((key for key, meta in TOPICS.items() if meta["name"] == topic_name), "dsa")
-    return build_coding_questions(topic_key, count)
-
-
-def generate_questions(topic: str, mode: str, count: int, api_key: str) -> list[dict[str, Any]]:
-    if mode == "mcq":
-        return build_mcq_questions(topic, count)
-
-    return build_coding_questions(topic, count)
 
 
 def build_bank_rows(topic: str, mode: str, count: int, start_index: int = 0) -> list[dict[str, Any]]:
@@ -623,393 +390,188 @@ def build_bank_rows(topic: str, mode: str, count: int, start_index: int = 0) -> 
     return build_coding_questions(topic, count, start_index=start_index)
 
 
-def pool_needs_rebuild(topic: str, mode: str, coll) -> bool:
-    docs = list(coll.find({"topic": topic, "mode": mode}).limit(5))
-    if not docs:
+def question_is_stale(question: Question, mode: str) -> bool:
+    if question.source != QUESTION_BANK_SOURCE:
+        return True
+    if not isinstance(question.sequence, int):
+        return True
+    if mode == "mcq":
+        return not question.options or len(question.options) < 4 or not question.answer
+    return not question.expected_approach
+
+
+def question_count(db: Session, topic: str, mode: str) -> int:
+    return int(
+        db.scalar(select(func.count(Question.id)).where(Question.topic == topic, Question.mode == mode)) or 0
+    )
+
+
+def pool_needs_rebuild(db: Session, topic: str, mode: str) -> bool:
+    rows = db.execute(
+        select(Question).where(Question.topic == topic, Question.mode == mode).order_by(Question.sequence.asc()).limit(5)
+    ).scalars().all()
+    if not rows:
         return False
-
-    for doc in docs:
-        if doc.get("source") != QUESTION_BANK_SOURCE:
-            return True
-        if not isinstance(doc.get("sequence"), int):
-            return True
-        if mode == "mcq":
-            if not isinstance(doc.get("options"), list) or len(doc.get("options", [])) < 4 or not doc.get("answer"):
-                return True
-        else:
-            if not doc.get("expected_approach"):
-                return True
-
-    return False
+    return any(question_is_stale(row, mode) for row in rows)
 
 
-def save_questions(topic: str, mode: str, rows: list[dict[str, Any]], db, source: str = QUESTION_BANK_SOURCE):
-    if db is None:
-        key = f"{topic}:{mode}"
-        existing = MEMORY_STORE["questions"].setdefault(key, [])
-        known = {q["question"] for q in existing}
-        for row in rows:
-            if row["question"] not in known:
-                row = dict(row)
-                row["id"] = f"mem-{topic}-{mode}-{len(existing)+1}"
-                row["source"] = source
-                existing.append(row)
-                known.add(row["question"])
-        return
-
-    coll = db["ai_questions"]
+def save_question_rows(db: Session, topic: str, mode: str, rows: list[dict[str, Any]]) -> int:
+    inserted = 0
     for row in rows:
-        doc = {
-            "topic": topic,
-            "mode": mode,
-            "question": row["question"],
-            "sequence": row.get("sequence") or extract_question_sequence(row["question"]),
-            "solution": row.get("solution", ""),
-            "difficulty": row.get("difficulty", "intermediate"),
-            "source": source,
-            "created_at": utc_now(),
-        }
-        if mode == "mcq":
-            doc["options"] = row.get("options", [])
-            doc["answer"] = row.get("answer", "")
-        else:
-            doc["constraints"] = row.get("constraints", "")
-            doc["sample_input"] = row.get("sample_input", "")
-            doc["sample_output"] = row.get("sample_output", "")
-            doc["expected_approach"] = row.get("expected_approach", "")
-
-        coll.update_one(
-            {"topic": topic, "mode": mode, "question": row["question"]},
-            {"$setOnInsert": doc},
-            upsert=True,
+        question = Question(
+            topic=topic,
+            mode=mode,
+            question=row["question"],
+            sequence=row.get("sequence") or extract_question_sequence(row["question"]),
+            difficulty=row.get("difficulty", "intermediate"),
+            source=QUESTION_BANK_SOURCE,
+            solution=row.get("solution", ""),
+            options=row.get("options"),
+            answer=row.get("answer"),
+            constraints=row.get("constraints"),
+            sample_input=row.get("sample_input"),
+            sample_output=row.get("sample_output"),
+            expected_approach=row.get("expected_approach"),
         )
-
-
-def ensure_pool(topic: str, mode: str, db, api_key: str, target: int = QUESTION_TARGET):
-    if db is None:
-        key = f"{topic}:{mode}"
-        current = len(MEMORY_STORE["questions"].get(key, []))
-        needed = max(0, target - current)
-        if needed:
-            rows = build_bank_rows(topic, mode, needed, start_index=current)
-            save_questions(topic, mode, rows, db, source=QUESTION_BANK_SOURCE)
-        return len(MEMORY_STORE["questions"].get(key, []))
-
-    coll = db["ai_questions"]
-    if pool_needs_rebuild(topic, mode, coll):
-        coll.delete_many({"topic": topic, "mode": mode})
-
-    current = coll.count_documents({"topic": topic, "mode": mode})
-    needed = max(0, target - current)
-    if needed > 0:
-        rows = build_bank_rows(topic, mode, needed, start_index=current)
-        save_questions(topic, mode, rows, db, source=QUESTION_BANK_SOURCE)
-    return coll.count_documents({"topic": topic, "mode": mode})
-
-
-def ensure_question_available(topic: str, mode: str, db, api_key: str):
-    return ensure_pool(topic, mode, db, api_key, target=QUESTION_TARGET)
-
-
-def ordered_questions(topic: str, mode: str, db):
-    if db is None:
-        key = f"{topic}:{mode}"
-        pool = [dict(question) for question in MEMORY_STORE["questions"].get(key, [])]
-        pool.sort(key=lambda item: (item.get("sequence") or extract_question_sequence(item.get("question", "")), item.get("question", "")))
-        return pool
-
-    coll = db["ai_questions"]
-    docs = list(coll.find({"topic": topic, "mode": mode}))
-    docs.sort(key=lambda item: (item.get("sequence") or extract_question_sequence(item.get("question", "")), str(item.get("_id", ""))))
-
-    ordered = []
-    for item in docs:
-        doc = dict(item)
-        doc["id"] = str(doc.get("_id"))
-        doc.pop("_id", None)
-        ordered.append(doc)
-    return ordered
-
-
-def question_at_position(topic: str, mode: str, db, position: int = 0):
-    ordered = ordered_questions(topic, mode, db)
-    if not ordered:
-        return None
-
-    index = position % len(ordered)
-    doc = dict(ordered[index])
-    doc["position"] = index
-    doc["pool_size"] = len(ordered)
-    return doc
-
-
-def find_question(question_id: str, topic: str, mode: str, db):
-    if db is None:
-        key = f"{topic}:{mode}"
-        for q in MEMORY_STORE["questions"].get(key, []):
-            if q.get("id") == question_id:
-                return q
-        return None
-
-    if ObjectId is None:
-        return None
-
+        db.add(question)
+        inserted += 1
     try:
-        doc = db["ai_questions"].find_one({"_id": ObjectId(question_id), "topic": topic, "mode": mode})
-    except Exception:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+    return inserted
+
+
+def ensure_question_pool(db: Session, topic: str, mode: str, target: int = QUESTION_TARGET) -> int:
+    if pool_needs_rebuild(db, topic, mode):
+        db.execute(delete(Question).where(Question.topic == topic, Question.mode == mode))
+        db.commit()
+
+    current = question_count(db, topic, mode)
+    needed = max(0, target - current)
+    if needed:
+        rows = build_bank_rows(topic, mode, needed, start_index=current)
+        save_question_rows(db, topic, mode, rows)
+    return question_count(db, topic, mode)
+
+
+def seed_question_bank(db: Session) -> None:
+    for topic in TOPICS:
+        for mode in MODES:
+            ensure_question_pool(db, topic, mode, target=QUESTION_TARGET)
+
+
+def serialize_question(question: Question) -> dict[str, Any]:
+    payload = {
+        "id": str(question.id),
+        "topic": question.topic,
+        "mode": question.mode,
+        "question": question.question,
+        "sequence": question.sequence,
+        "difficulty": question.difficulty,
+        "solution": question.solution or "",
+    }
+    if question.mode == "mcq":
+        payload["options"] = list(question.options or [])
+        payload["answer"] = question.answer or ""
+    else:
+        payload["constraints"] = question.constraints or ""
+        payload["sample_input"] = question.sample_input or "N/A"
+        payload["sample_output"] = question.sample_output or "N/A"
+        payload["expected_approach"] = question.expected_approach or ""
+    return payload
+
+
+def ordered_questions(db: Session, topic: str, mode: str) -> list[Question]:
+    return db.execute(
+        select(Question)
+        .where(Question.topic == topic, Question.mode == mode)
+        .order_by(Question.sequence.asc(), Question.id.asc())
+    ).scalars().all()
+
+
+def question_at_position(db: Session, topic: str, mode: str, position: int = 0) -> dict[str, Any] | None:
+    rows = ordered_questions(db, topic, mode)
+    if not rows:
         return None
-    if not doc:
+    index = position % len(rows)
+    payload = serialize_question(rows[index])
+    payload["position"] = index
+    payload["pool_size"] = len(rows)
+    return payload
+
+
+def find_question(db: Session, question_id: str, topic: str, mode: str) -> Question | None:
+    try:
+        numeric_id = int(question_id)
+    except ValueError:
         return None
-    doc["id"] = str(doc.get("_id"))
-    doc.pop("_id", None)
-    return doc
-
-
-def evaluate_coding(question: dict[str, Any], answer: str, api_key: str):
-    fallback = {
-        "is_correct": len(answer.strip()) > 20,
-        "feedback": "Add algorithm logic, edge cases, and complexity details." if len(answer.strip()) <= 20 else "Reasonable attempt. Compare with solution and refine edge cases.",
-    }
-    prompt = f"""
-Evaluate interview answer and return strict JSON:
-{{"is_correct": true/false, "feedback": "short practical feedback"}}
-Question: {question.get('question')}
-Expected approach: {question.get('expected_approach')}
-User answer: {answer}
-"""
-    result = call_gemini_json(prompt, fallback, api_key)
-    if not isinstance(result, dict):
-        return fallback
-    return {
-        "is_correct": bool(result.get("is_correct", False)),
-        "feedback": str(result.get("feedback", fallback["feedback"])).strip(),
-    }
-
-
-def save_attempt(payload: dict[str, Any], db):
-    if db is None:
-        MEMORY_STORE["attempts"].append(payload)
-        return
-    db["attempts"].insert_one(payload)
-
-
-def fetch_recent_attempts(user_id: str, db, limit: int = 8):
-    if db is None:
-        rows = [a for a in MEMORY_STORE["attempts"] if a.get("user_id") == user_id]
-        rows.sort(key=lambda x: x.get("created_at", utc_now()), reverse=True)
-        return rows[:limit]
-    return list(db["attempts"].find({"user_id": user_id}).sort("created_at", -1).limit(limit))
-
-
-def save_chat(payload: dict[str, Any], db):
-    if db is None:
-        MEMORY_STORE["chat_logs"].append(payload)
-        return
-    db["chat_logs"].insert_one(payload)
-
-
-def chat_history(user_id: str, db, limit: int = 20):
-    if db is None:
-        rows = [x for x in MEMORY_STORE["chat_logs"] if x.get("user_id") == user_id]
-        rows.sort(key=lambda x: x.get("created_at", utc_now()))
-        return rows[-limit:]
-    rows = list(db["chat_logs"].find({"user_id": user_id}).sort("created_at", -1).limit(limit))
-    rows.reverse()
-    for row in rows:
-        row.pop("_id", None)
-    return rows
-
-
-def clear_chat_history(user_id: str, db):
-    if db is None:
-        MEMORY_STORE["chat_logs"] = [x for x in MEMORY_STORE["chat_logs"] if x.get("user_id") != user_id]
-        return
-    db["chat_logs"].delete_many({"user_id": user_id})
-
-
-@app.get("/")
-def home():
-    return FileResponse(FRONTEND_DIR / "index.html")
-
-
-@app.get("/api/status")
-def api_status(x_gemini_key: str | None = Header(default=None)):
-    db = get_mongo_db()
-    gemini_key = resolve_gemini_key(x_gemini_key)
-    gemini_ok = configure_genai(gemini_key)
-    return {
-        "mongo": db is not None,
-        "gemini": gemini_ok,
-        "model": DEFAULT_GEMINI_MODEL,
-    }
-
-
-@app.get("/api/topics")
-def api_topics():
-    return {
-        "topics": TOPICS,
-        "modes": MODES,
-    }
-
-
-@app.post("/api/auth/signup")
-def api_auth_signup(payload: AuthRequest):
-    return create_user(payload.username, payload.password)
-
-
-@app.post("/api/auth/login")
-def api_auth_login(payload: AuthRequest):
-    return login_user(payload.username, payload.password)
-
-
-@app.post("/api/questions/generate")
-def api_generate_questions(payload: GenerateQuestionsRequest, x_gemini_key: str | None = Header(default=None)):
-    topic = payload.topic.lower()
-    mode = payload.mode.lower()
-    if topic not in TOPICS:
-        raise HTTPException(status_code=400, detail="Invalid topic")
-    if mode not in MODES:
-        raise HTTPException(status_code=400, detail="Invalid mode")
-
-    db = get_mongo_db()
-    key = resolve_gemini_key(x_gemini_key)
-    count = ensure_pool(topic, mode, db, key, target=min(payload.count, QUESTION_TARGET))
-    return {"stored_questions": count}
-
-
-@app.get("/api/questions/random")
-def api_random_question(
-    topic: str = Query(...),
-    mode: str = Query(...),
-    position: int = Query(default=0, ge=0),
-    x_gemini_key: str | None = Header(default=None),
-):
-    topic = topic.lower()
-    mode = mode.lower()
-    if topic not in TOPICS:
-        raise HTTPException(status_code=400, detail="Invalid topic")
-    if mode not in MODES:
-        raise HTTPException(status_code=400, detail="Invalid mode")
-
-    db = get_mongo_db()
-    key = resolve_gemini_key(x_gemini_key)
-    ensure_question_available(topic, mode, db, key)
-    question = question_at_position(topic, mode, db, position=position)
+    question = db.get(Question, numeric_id)
     if not question:
-        raise HTTPException(status_code=500, detail="Could not load question")
-    question["topic"] = topic
-    question["mode"] = mode
+        return None
+    if question.topic != topic or question.mode != mode:
+        return None
     return question
 
 
-@app.post("/api/attempts/submit")
-def api_submit_attempt(payload: SubmitAttemptRequest, x_gemini_key: str | None = Header(default=None)):
-    topic = payload.topic.lower()
-    mode = payload.mode.lower()
-    if topic not in TOPICS or mode not in MODES:
-        raise HTTPException(status_code=400, detail="Invalid topic or mode")
-
-    db = get_mongo_db()
-    question = find_question(payload.question_id, topic, mode, db)
-    if not question:
-        raise HTTPException(status_code=404, detail="Question not found")
-
-    key = resolve_gemini_key(x_gemini_key)
-
-    if mode == "mcq":
-        is_correct = payload.answer == question.get("answer")
-        feedback = "Correct answer." if is_correct else "Wrong answer. Use solution to improve."
-        correct_answer = question.get("answer", "")
-    else:
-        eval_result = evaluate_coding(question, payload.answer, key)
-        is_correct = eval_result["is_correct"]
-        feedback = eval_result["feedback"]
-        correct_answer = ""
-
-    attempt = {
-        "user_id": payload.user_id,
-        "topic": topic,
-        "mode": mode,
-        "question": question.get("question", ""),
-        "question_id": payload.question_id,
-        "submitted_answer": payload.answer,
-        "is_correct": is_correct,
-        "feedback": feedback,
-        "solution": question.get("solution", ""),
-        "correct_answer": correct_answer,
-        "expected_approach": question.get("expected_approach", ""),
-        "created_at": utc_now(),
-    }
-    save_attempt(attempt, db)
-
+def serialize_chat_log(row: ChatLog) -> dict[str, Any]:
     return {
-        "is_correct": is_correct,
-        "feedback": feedback,
-        "solution": question.get("solution", ""),
-        "correct_answer": correct_answer,
-        "expected_approach": question.get("expected_approach", ""),
+        "id": str(row.id),
+        "user_id": row.user_id,
+        "user_message": row.user_message,
+        "assistant_message": row.assistant_message,
+        "provider": row.provider,
+        "related_suggestions": list(row.related_suggestions or []),
+        "created_at": row.created_at.isoformat(),
     }
 
 
-@app.get("/api/chat/history")
-def api_chat_history(user_id: str = Query("local-user")):
-    db = get_mongo_db()
-    return {"history": chat_history(user_id, db)}
+def fetch_recent_attempts(db: Session, user_id: str, limit: int = 8) -> list[Attempt]:
+    return db.execute(
+        select(Attempt).where(Attempt.user_id == user_id).order_by(desc(Attempt.created_at)).limit(limit)
+    ).scalars().all()
 
 
-@app.post("/api/chat")
-def api_chat(payload: ChatRequest, x_gemini_key: str | None = Header(default=None)):
-    user_id = payload.user_id
-    message = payload.message.strip()
-    if not message:
-        raise HTTPException(status_code=400, detail="Message is required")
+def chat_history(db: Session, user_id: str, limit: int = 20) -> list[dict[str, Any]]:
+    rows = db.execute(
+        select(ChatLog).where(ChatLog.user_id == user_id).order_by(desc(ChatLog.created_at)).limit(limit)
+    ).scalars().all()
+    rows = list(reversed(rows))
+    return [serialize_chat_log(row) for row in rows]
 
-    db = get_mongo_db()
-    recent = fetch_recent_attempts(user_id, db, limit=8)
-    recent_chats = chat_history(user_id, db, limit=6)
-    context_lines = []
-    for row in recent:
-        status = "correct" if row.get("is_correct") else "wrong"
-        context_lines.append(f"- {row.get('topic', '').upper()} {row.get('mode', '').upper()}: {row.get('question', '')} => {status}")
-    recent_chat_lines = []
-    for row in recent_chats:
-        q = str(row.get("user_message", "")).strip()
-        a = str(row.get("assistant_message", "")).strip()
-        if q:
-            recent_chat_lines.append(f"- User: {q}")
-        if a:
-            recent_chat_lines.append(f"- Assistant: {a[:220]}")
 
-    key = resolve_gemini_key(x_gemini_key)
-    if not key:
-        answer = "Gemini API key is not configured on server. Set GEMINI_API_KEY and restart backend."
-        related_suggestions = [
-            "Set GEMINI_API_KEY and restart backend.",
-            "Ask again after backend restart.",
-        ]
-        record = {
-            "user_id": user_id,
-            "user_message": message,
-            "assistant_message": answer,
-            "related_suggestions": related_suggestions,
-            "created_at": utc_now(),
-        }
-        save_chat(record, db)
-        return {"answer": answer, "related_suggestions": related_suggestions}
+def save_chat_log(db: Session, user_id: str, user_message: str, assistant_message: str, related_suggestions: list[str], provider: str) -> None:
+    db.add(
+        ChatLog(
+            user_id=user_id,
+            user_message=user_message,
+            assistant_message=assistant_message,
+            related_suggestions=related_suggestions,
+            provider=provider,
+        )
+    )
+    db.commit()
 
-    fallback = {"answer": "Gemini request failed. Check API key, billing, and model access."}
-    topic = (payload.topic or "").lower().strip()
-    mode = (payload.mode or "").lower().strip()
-    topic_name = TOPICS.get(topic, {}).get("name", "")
-    mode_name = MODES.get(mode, "")
 
-    prompt = f"""
+def clear_chat_history(db: Session, user_id: str) -> None:
+    db.execute(delete(ChatLog).where(ChatLog.user_id == user_id))
+    db.commit()
+
+
+def build_chat_prompt(
+    message: str,
+    context_lines: list[str],
+    recent_chat_lines: list[str],
+    topic_name: str,
+    mode_name: str,
+) -> str:
+    return f"""
 You are a coding interview mentor and technical Q&A assistant.
-Answer the exact question user asked, even if no topic/mode is selected.
-Default to programming/coding interpretation unless user explicitly asks non-technical career/HR advice.
-Do not redirect user to select C++/Java/Python/DSA; just answer directly.
-You can answer theory, syntax, coding examples, DSA, debugging, complexity, interview questions, project questions, and follow-ups from previous chat.
-If the user asks "this", "that", "same", "previous", or a short follow-up, infer the topic from recent chat context.
+Answer the exact question the user asked, even if no topic or mode is selected.
+Default to programming and coding interpretation unless the user explicitly asks for non-technical career advice.
+Do not redirect the user to select a language. Just answer directly.
+If the current message clearly names a topic like pointer, linked list, stack, queue, tree, graph, array, or reference, answer that topic directly and do not let previous chat context change the meaning.
+For pointer questions, default to C or C++ style pointers unless the user explicitly asks about Python object references.
 
 Response style requirements:
 - Keep language simple and practical.
@@ -1017,7 +579,7 @@ Response style requirements:
 - Prefer short sections rather than one long paragraph.
 - No follow-up question at the end.
 - Include 2 or 3 short related follow-up suggestions that are specific to the user's topic.
-- Suggestions must not be generic. Avoid phrases like "show a code example for this" unless you name the concept.
+- Suggestions must not be generic.
 
 Recent user context:
 {chr(10).join(context_lines) if context_lines else 'No recent attempts'}
@@ -1025,8 +587,8 @@ Recent user context:
 Recent chat context:
 {chr(10).join(recent_chat_lines) if recent_chat_lines else 'No previous chat context'}
 
-Current selected topic: {topic_name if topic_name else 'Not selected'}
-Current selected mode: {mode_name if mode_name else 'Not selected'}
+Current selected topic: {topic_name or 'Not selected'}
+Current selected mode: {mode_name or 'Not selected'}
 
 User question:
 {message}
@@ -1036,46 +598,358 @@ Return strict JSON:
   "answer": "...",
   "related_suggestions": ["...", "..."]
 }}
-"""
-    out = call_gemini_json(prompt, fallback, key)
-    if isinstance(out, dict) and any(k in out for k in ["direct_answer", "core_concept", "example", "common_mistakes", "when_to_use"]):
-        answer = compose_structured_answer(out) or fallback["answer"]
-    else:
-        answer = out.get("answer") if isinstance(out, dict) else fallback["answer"]
-        answer = normalize_chat_answer(answer) or fallback["answer"]
+""".strip()
 
-    if answer.lower().startswith("gemini request failed"):
-        answer = build_local_structured_answer(message)
 
-    related_suggestions = []
-    if isinstance(out, dict):
-        maybe_suggestions = out.get("related_suggestions", [])
-        if isinstance(maybe_suggestions, list):
-            related_suggestions = [str(x).strip() for x in maybe_suggestions if str(x).strip()][:3]
+def evaluate_coding(question: Question, answer: str, provider: str | None) -> dict[str, Any]:
+    fallback = {
+        "is_correct": len(answer.strip()) > 20,
+        "feedback": "Add algorithm logic, edge cases, and complexity details." if len(answer.strip()) <= 20 else "Reasonable attempt. Compare with solution and refine edge cases.",
+    }
+    prompt = f"""
+Evaluate an interview-style coding answer and return strict JSON:
+{{"is_correct": true, "feedback": "short practical feedback"}}
+Question: {question.question}
+Expected approach: {question.expected_approach or ""}
+Reference solution: {question.solution or ""}
+User answer: {answer}
+""".strip()
+    try:
+        raw_text, _ = generate_text(prompt, provider=provider, max_tokens=250)
+        parsed = parse_json_from_text(raw_text)
+        if not isinstance(parsed, dict):
+            return fallback
+        return {
+            "is_correct": bool(parsed.get("is_correct", False)),
+            "feedback": str(parsed.get("feedback", fallback["feedback"])).strip() or fallback["feedback"],
+        }
+    except Exception:
+        return fallback
+
+
+def generate_chat_completion(payload: ChatRequest, db: Session) -> tuple[str, list[str], str]:
+    message = payload.message.strip()
+    primary_message = extract_primary_chat_query(message)
+    requested_provider = (payload.provider or "").strip().lower() or None
+
+    recent_attempts = fetch_recent_attempts(db, payload.user_id, limit=8)
+    recent_chat_rows = chat_history(db, payload.user_id, limit=6)
+
+    context_lines = []
+    for row in recent_attempts:
+        status = "correct" if row.is_correct else "wrong"
+        context_lines.append(f"- {row.topic.upper()} {row.mode.upper()}: {row.question} => {status}")
+
+    recent_chat_lines = []
+    for row in recent_chat_rows:
+        q = str(row.get("user_message", "")).strip()
+        a = str(row.get("assistant_message", "")).strip()
+        if q:
+            recent_chat_lines.append(f"- User: {q}")
+        if a:
+            recent_chat_lines.append(f"- Assistant: {a[:220]}")
+
+    if prefer_local_chat_answer(message):
+        answer = build_local_structured_answer(primary_message)
+        return answer, build_related_suggestions(primary_message, answer), "local"
+
+    topic = (payload.topic or "").lower().strip()
+    mode = (payload.mode or "").lower().strip()
+    prompt = build_chat_prompt(
+        message,
+        context_lines,
+        recent_chat_lines,
+        TOPICS.get(topic, {}).get("name", ""),
+        MODES.get(mode, ""),
+    )
+
+    fallback_answer = build_local_structured_answer(primary_message or message)
+    provider_used = "local"
+    related_suggestions: list[str] = []
+
+    try:
+        raw_text, provider_used = generate_text(prompt, provider=requested_provider, max_tokens=CHAT_MAX_OUTPUT_TOKENS)
+        parsed = parse_json_from_text(raw_text)
+        if isinstance(parsed, dict) and any(
+            key in parsed for key in ("direct_answer", "core_concept", "example", "common_mistakes", "when_to_use")
+        ):
+            answer = compose_structured_answer(parsed) or fallback_answer
+        elif isinstance(parsed, dict):
+            answer = normalize_chat_answer(parsed.get("answer", "")) or fallback_answer
+            maybe_suggestions = parsed.get("related_suggestions", [])
+            if isinstance(maybe_suggestions, list):
+                related_suggestions = [str(item).strip() for item in maybe_suggestions if str(item).strip()][:3]
+        else:
+            answer = normalize_chat_answer(raw_text) or fallback_answer
+    except (LLMUnavailableError, RuntimeError, ValueError, json.JSONDecodeError):
+        answer = fallback_answer
+        provider_used = "local"
+    except Exception:
+        answer = fallback_answer
+        provider_used = "local"
+
+    if "pointer" in primary_message.lower() and "python does not have explicit" in answer.lower() and "python" not in primary_message.lower():
+        answer = build_local_structured_answer(primary_message)
+        provider_used = "local"
 
     if use_local_suggestions(related_suggestions):
-        related_suggestions = build_related_suggestions(message, answer)
+        related_suggestions = build_related_suggestions(primary_message or message, answer)
 
-    record = {
-        "user_id": user_id,
-        "user_message": message,
-        "assistant_message": answer,
-        "related_suggestions": related_suggestions,
-        "created_at": utc_now(),
+    return answer, related_suggestions, provider_used
+
+
+def iter_answer_chunks(text: str) -> list[str]:
+    parts = re.findall(r"\S+\s*", text)
+    if not parts:
+        return [text]
+    chunks = []
+    for index in range(0, len(parts), 6):
+        chunks.append("".join(parts[index:index + 6]))
+    return chunks
+
+
+def frontend_not_built_response() -> HTMLResponse:
+    return HTMLResponse(
+        """
+        <html>
+          <head>
+            <title>Frontend Not Built</title>
+            <style>
+              body { font-family: Segoe UI, sans-serif; background: #0b1220; color: #e5eef8; padding: 48px; }
+              .card { max-width: 880px; margin: 0 auto; background: #111b2e; border: 1px solid #223453; border-radius: 16px; padding: 28px; }
+              code { background: #0a1424; padding: 2px 6px; border-radius: 6px; }
+              pre { background: #08111f; padding: 16px; border-radius: 12px; overflow-x: auto; }
+            </style>
+          </head>
+          <body>
+            <div class="card">
+              <h1>Frontend build not found</h1>
+              <p>This project now uses a Vite React + TypeScript + Tailwind frontend.</p>
+              <p>Run one of these:</p>
+              <pre>cd frontend
+npm install
+npm run dev</pre>
+              <p>Or run Docker:</p>
+              <pre>docker compose up --build</pre>
+            </div>
+          </body>
+        </html>
+        """.strip()
+    )
+
+
+@app.on_event("startup")
+def on_startup() -> None:
+    Base.metadata.create_all(bind=engine)
+    db = SessionLocal()
+    try:
+        seed_question_bank(db)
+    finally:
+        db.close()
+
+
+@app.get("/api/status")
+def api_status() -> dict[str, Any]:
+    return {
+        "database": database_label(),
+        "database_url": engine.url.render_as_string(hide_password=True),
+        "providers": provider_status(),
+        "default_provider": default_provider_name(),
+        "frontend_built": (FRONTEND_DIST_DIR / "index.html").exists(),
     }
-    save_chat(record, db)
 
-    return {"answer": answer, "related_suggestions": related_suggestions}
+
+@app.get("/api/topics")
+def api_topics() -> dict[str, Any]:
+    return {"topics": TOPICS, "modes": MODES}
+
+
+@app.post("/api/auth/signup")
+def api_auth_signup(payload: AuthRequest, db: Session = Depends(get_db)) -> dict[str, str]:
+    normalized = normalize_username(payload.username)
+    if not re.fullmatch(r"[a-z0-9_]{3,40}", normalized):
+        raise HTTPException(status_code=400, detail="Username must be 3-40 characters using letters, numbers, or underscore.")
+    if len(payload.password.strip()) < 4:
+        raise HTTPException(status_code=400, detail="Password must be at least 4 characters.")
+
+    existing = db.execute(select(User).where(User.username == normalized)).scalar_one_or_none()
+    if existing:
+        raise HTTPException(status_code=409, detail="Account already exists. Use login instead.")
+
+    user = User(username=normalized, password_hash=hash_password(payload.password))
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    return auth_response(user)
+
+
+@app.post("/api/auth/login")
+def api_auth_login(payload: AuthRequest, db: Session = Depends(get_db)) -> dict[str, str]:
+    normalized = normalize_username(payload.username)
+    user = db.execute(select(User).where(User.username == normalized)).scalar_one_or_none()
+    if not user:
+        raise HTTPException(status_code=404, detail="Account not found. Sign up first.")
+    if not verify_password(payload.password, user.password_hash):
+        raise HTTPException(status_code=401, detail="Incorrect password.")
+
+    user.last_login_at = utc_now()
+    db.commit()
+    return auth_response(user)
+
+
+@app.post("/api/questions/generate")
+def api_generate_questions(payload: GenerateQuestionsRequest, db: Session = Depends(get_db)) -> dict[str, int]:
+    topic = payload.topic.lower().strip()
+    mode = payload.mode.lower().strip()
+    if topic not in TOPICS:
+        raise HTTPException(status_code=400, detail="Invalid topic")
+    if mode not in MODES:
+        raise HTTPException(status_code=400, detail="Invalid mode")
+    count = ensure_question_pool(db, topic, mode, target=min(payload.count, QUESTION_TARGET))
+    return {"stored_questions": count}
+
+
+@app.get("/api/questions/random")
+def api_random_question(
+    topic: str = Query(...),
+    mode: str = Query(...),
+    position: int = Query(default=0, ge=0),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    topic = topic.lower().strip()
+    mode = mode.lower().strip()
+    if topic not in TOPICS:
+        raise HTTPException(status_code=400, detail="Invalid topic")
+    if mode not in MODES:
+        raise HTTPException(status_code=400, detail="Invalid mode")
+
+    ensure_question_pool(db, topic, mode)
+    question = question_at_position(db, topic, mode, position=position)
+    if not question:
+        raise HTTPException(status_code=500, detail="Could not load question")
+    return question
+
+
+@app.post("/api/attempts/submit")
+def api_submit_attempt(payload: SubmitAttemptRequest, db: Session = Depends(get_db)) -> dict[str, Any]:
+    topic = payload.topic.lower().strip()
+    mode = payload.mode.lower().strip()
+    if topic not in TOPICS or mode not in MODES:
+        raise HTTPException(status_code=400, detail="Invalid topic or mode")
+
+    question = find_question(db, payload.question_id, topic, mode)
+    if not question:
+        raise HTTPException(status_code=404, detail="Question not found")
+
+    if mode == "mcq":
+        is_correct = payload.answer == (question.answer or "")
+        feedback = "Correct answer." if is_correct else "Wrong answer. Use the explanation and retry."
+        correct_answer = question.answer or ""
+    else:
+        evaluation = evaluate_coding(question, payload.answer, payload.provider)
+        is_correct = evaluation["is_correct"]
+        feedback = evaluation["feedback"]
+        correct_answer = ""
+
+    db.add(
+        Attempt(
+            user_id=payload.user_id,
+            topic=topic,
+            mode=mode,
+            question=question.question,
+            question_id=str(question.id),
+            submitted_answer=payload.answer,
+            is_correct=is_correct,
+            feedback=feedback,
+            solution=question.solution or "",
+            correct_answer=correct_answer,
+            expected_approach=question.expected_approach or "",
+        )
+    )
+    db.commit()
+
+    return {
+        "is_correct": is_correct,
+        "feedback": feedback,
+        "solution": question.solution or "",
+        "correct_answer": correct_answer,
+        "expected_approach": question.expected_approach or "",
+    }
+
+
+@app.get("/api/chat/history")
+def api_chat_history(user_id: str = Query(...), db: Session = Depends(get_db)) -> dict[str, Any]:
+    return {"history": chat_history(db, user_id)}
+
+
+@app.post("/api/chat")
+def api_chat(payload: ChatRequest, db: Session = Depends(get_db)) -> dict[str, Any]:
+    message = payload.message.strip()
+    if not message:
+        raise HTTPException(status_code=400, detail="Message is required")
+
+    answer, related_suggestions, provider_used = generate_chat_completion(payload, db)
+    save_chat_log(db, payload.user_id, message, answer, related_suggestions, provider_used)
+    return {
+        "answer": answer,
+        "related_suggestions": related_suggestions,
+        "provider": provider_used,
+    }
+
+
+@app.post("/api/chat/stream")
+def api_chat_stream(payload: ChatRequest, db: Session = Depends(get_db)) -> StreamingResponse:
+    message = payload.message.strip()
+    if not message:
+        raise HTTPException(status_code=400, detail="Message is required")
+
+    answer, related_suggestions, provider_used = generate_chat_completion(payload, db)
+    save_chat_log(db, payload.user_id, message, answer, related_suggestions, provider_used)
+
+    def stream():
+        for chunk in iter_answer_chunks(answer):
+            yield json.dumps({"type": "token", "value": chunk}) + "\n"
+        yield json.dumps(
+            {
+                "type": "done",
+                "answer": answer,
+                "related_suggestions": related_suggestions,
+                "provider": provider_used,
+            }
+        ) + "\n"
+
+    return StreamingResponse(stream(), media_type="application/x-ndjson")
 
 
 @app.post("/api/chat/clear")
-def api_chat_clear(payload: ClearChatRequest):
-    db = get_mongo_db()
-    clear_chat_history(payload.user_id, db)
+def api_chat_clear(payload: ClearChatRequest, db: Session = Depends(get_db)) -> dict[str, bool]:
+    clear_chat_history(db, payload.user_id)
     return {"ok": True}
 
 
-app.mount("/frontend", StaticFiles(directory=str(FRONTEND_DIR)), name="frontend")
+def serve_frontend_asset(full_path: str) -> FileResponse | HTMLResponse:
+    index_path = FRONTEND_DIST_DIR / "index.html"
+    if not index_path.exists():
+        return frontend_not_built_response()
+
+    if full_path:
+        candidate = (FRONTEND_DIST_DIR / full_path).resolve()
+        dist_root = FRONTEND_DIST_DIR.resolve()
+        if candidate.exists() and candidate.is_file() and candidate.is_relative_to(dist_root):
+            return FileResponse(candidate)
+    return FileResponse(index_path)
+
+
+@app.get("/", include_in_schema=False, response_model=None)
+def home():
+    return serve_frontend_asset("")
+
+
+@app.get("/{full_path:path}", include_in_schema=False, response_model=None)
+def frontend_routes(full_path: str):
+    if full_path.startswith("api"):
+        raise HTTPException(status_code=404, detail="Not found")
+    return serve_frontend_asset(full_path)
 
 
 if __name__ == "__main__":
