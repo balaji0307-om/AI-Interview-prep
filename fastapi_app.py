@@ -2,24 +2,29 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import secrets
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query
+from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import delete, desc, func, select
+from sqlalchemy import delete, desc, func, inspect, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from cache import cache_backend_name, cache_get, cache_set, rate_limit_allowed
 from database import Base, SessionLocal, database_label, engine, get_db
 from llm_provider import LLMUnavailableError, default_provider_name, generate_text, provider_status
 from models import Attempt, ChatLog, Question, User
+from observability import ObservabilityMiddleware, logger, metrics_snapshot
 from question_bank import QUESTION_BANK_SIZE, build_coding_questions, build_mcq_questions, extract_question_sequence
+from rag_store import RagDocument, index_documents, search as rag_search
+from security import TokenError, create_access_token, decode_access_token
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -28,6 +33,11 @@ FRONTEND_DIST_DIR = FRONTEND_DIR / "dist"
 QUESTION_TARGET = QUESTION_BANK_SIZE
 QUESTION_BANK_SOURCE = "question-bank-v3-sqlalchemy"
 CHAT_MAX_OUTPUT_TOKENS = 900
+ADMIN_USERNAMES = {
+    username.strip().lower()
+    for username in os.getenv("ADMIN_USERNAMES", "").split(",")
+    if username.strip()
+}
 
 TOPICS = {
     "python": {
@@ -55,6 +65,7 @@ TOPICS = {
 MODES = {"mcq": "MCQ", "coding": "Coding"}
 
 app = FastAPI(title="Interview Prep AI Stack")
+app.add_middleware(ObservabilityMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -96,6 +107,11 @@ class ClearChatRequest(BaseModel):
     user_id: str
 
 
+class RagIndexRequest(BaseModel):
+    documents: list[str] = Field(min_length=1, max_length=50)
+    source: str = Field(default="manual", max_length=60)
+
+
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -124,7 +140,88 @@ def normalize_username(username: str) -> str:
 
 
 def auth_response(user: User) -> dict[str, str]:
-    return {"user_id": str(user.id), "username": user.username}
+    role = user.role or "user"
+    return {
+        "user_id": str(user.id),
+        "username": user.username,
+        "role": role,
+        "access_token": create_access_token(user_id=str(user.id), username=user.username, role=role),
+        "token_type": "bearer",
+    }
+
+
+def current_user(
+    authorization: str = Header(default=""),
+    db: Session = Depends(get_db),
+) -> User:
+    if not authorization.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="Missing bearer token.")
+    token = authorization.split(" ", 1)[1].strip()
+    try:
+        payload = decode_access_token(token)
+    except TokenError as exc:
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
+
+    user_id = str(payload.get("sub", ""))
+    if not user_id.isdigit():
+        raise HTTPException(status_code=401, detail="Invalid token subject.")
+    user = db.get(User, int(user_id))
+    if not user:
+        raise HTTPException(status_code=401, detail="User not found.")
+    return user
+
+
+def require_admin(user: User = Depends(current_user)) -> User:
+    if (user.role or "user") != "admin":
+        raise HTTPException(status_code=403, detail="Admin role required.")
+    return user
+
+
+def verify_payload_user(payload_user_id: str, user: User) -> None:
+    if str(user.id) != str(payload_user_id):
+        raise HTTPException(status_code=403, detail="Cannot access another user's data.")
+
+
+def rate_limit_request(request: Request, user: User | None = None) -> None:
+    identity = f"user:{user.id}" if user else f"ip:{request.client.host if request.client else 'unknown'}"
+    if not rate_limit_allowed(identity):
+        raise HTTPException(status_code=429, detail="Rate limit exceeded. Try again soon.")
+
+
+def ensure_runtime_schema() -> None:
+    inspector = inspect(engine)
+    if "users" not in inspector.get_table_names():
+        return
+    columns = {column["name"] for column in inspector.get_columns("users")}
+    if "role" not in columns:
+        with engine.begin() as connection:
+            connection.execute(text("ALTER TABLE users ADD COLUMN role VARCHAR(24) DEFAULT 'user'"))
+
+
+def index_question_bank_for_rag(db: Session) -> int:
+    rows = db.execute(select(Question).limit(500)).scalars().all()
+    documents = [
+        RagDocument(
+            id=f"question:{row.id}",
+            text=" ".join(
+                part
+                for part in [
+                    row.question,
+                    row.solution or "",
+                    row.expected_approach or "",
+                    row.answer or "",
+                ]
+                if part
+            ),
+            metadata={"topic": row.topic, "mode": row.mode, "source": "question_bank"},
+        )
+        for row in rows
+    ]
+    return index_documents(documents)
+
+
+def log_chat_created(user_id: str, provider: str) -> None:
+    logger.info("chat_created user_id=%s provider=%s", user_id, provider)
 
 
 def parse_json_from_text(text: str) -> Any:
@@ -562,6 +659,7 @@ def build_chat_prompt(
     message: str,
     context_lines: list[str],
     recent_chat_lines: list[str],
+    rag_lines: list[str],
     topic_name: str,
     mode_name: str,
 ) -> str:
@@ -586,6 +684,9 @@ Recent user context:
 
 Recent chat context:
 {chr(10).join(recent_chat_lines) if recent_chat_lines else 'No previous chat context'}
+
+Retrieved reference context:
+{chr(10).join(rag_lines) if rag_lines else 'No retrieved reference context'}
 
 Current selected topic: {topic_name or 'Not selected'}
 Current selected mode: {mode_name or 'Not selected'}
@@ -649,6 +750,8 @@ def generate_chat_completion(payload: ChatRequest, db: Session) -> tuple[str, li
         if a:
             recent_chat_lines.append(f"- Assistant: {a[:220]}")
 
+    rag_lines = [f"- {document.text[:260]}" for document in rag_search(primary_message or message, limit=3)]
+
     if prefer_local_chat_answer(message):
         answer = build_local_structured_answer(primary_message)
         return answer, build_related_suggestions(primary_message, answer), "local"
@@ -659,6 +762,7 @@ def generate_chat_completion(payload: ChatRequest, db: Session) -> tuple[str, li
         message,
         context_lines,
         recent_chat_lines,
+        rag_lines,
         TOPICS.get(topic, {}).get("name", ""),
         MODES.get(mode, ""),
     )
@@ -741,9 +845,12 @@ npm run dev</pre>
 @app.on_event("startup")
 def on_startup() -> None:
     Base.metadata.create_all(bind=engine)
+    ensure_runtime_schema()
     db = SessionLocal()
     try:
         seed_question_bank(db)
+        indexed = index_question_bank_for_rag(db)
+        logger.info("startup database=%s cache=%s rag_indexed=%s", database_label(), cache_backend_name(), indexed)
     finally:
         db.close()
 
@@ -753,6 +860,7 @@ def api_status() -> dict[str, Any]:
     return {
         "database": database_label(),
         "database_url": engine.url.render_as_string(hide_password=True),
+        "cache": cache_backend_name(),
         "providers": provider_status(),
         "default_provider": default_provider_name(),
         "frontend_built": (FRONTEND_DIST_DIR / "index.html").exists(),
@@ -761,7 +869,35 @@ def api_status() -> dict[str, Any]:
 
 @app.get("/api/topics")
 def api_topics() -> dict[str, Any]:
-    return {"topics": TOPICS, "modes": MODES}
+    cached = cache_get("topics:modes")
+    if cached:
+        return cached
+    payload = {"topics": TOPICS, "modes": MODES}
+    cache_set("topics:modes", payload, ttl_seconds=300)
+    return payload
+
+
+@app.get("/api/metrics")
+def api_metrics(_: User = Depends(require_admin)) -> dict[str, object]:
+    return metrics_snapshot()
+
+
+@app.get("/api/me")
+def api_me(user: User = Depends(current_user)) -> dict[str, str]:
+    return {"user_id": str(user.id), "username": user.username, "role": user.role or "user"}
+
+
+@app.post("/api/rag/index")
+def api_rag_index(payload: RagIndexRequest, _: User = Depends(require_admin)) -> dict[str, int]:
+    documents = [
+        RagDocument(
+            id=f"{payload.source}:{hashlib.sha256(document.encode('utf-8')).hexdigest()}",
+            text=document,
+            metadata={"source": payload.source},
+        )
+        for document in payload.documents
+    ]
+    return {"indexed": index_documents(documents)}
 
 
 @app.post("/api/auth/signup")
@@ -776,7 +912,8 @@ def api_auth_signup(payload: AuthRequest, db: Session = Depends(get_db)) -> dict
     if existing:
         raise HTTPException(status_code=409, detail="Account already exists. Use login instead.")
 
-    user = User(username=normalized, password_hash=hash_password(payload.password))
+    role = "admin" if normalized in ADMIN_USERNAMES else "user"
+    user = User(username=normalized, password_hash=hash_password(payload.password), role=role)
     db.add(user)
     db.commit()
     db.refresh(user)
@@ -798,7 +935,11 @@ def api_auth_login(payload: AuthRequest, db: Session = Depends(get_db)) -> dict[
 
 
 @app.post("/api/questions/generate")
-def api_generate_questions(payload: GenerateQuestionsRequest, db: Session = Depends(get_db)) -> dict[str, int]:
+def api_generate_questions(
+    payload: GenerateQuestionsRequest,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_admin),
+) -> dict[str, int]:
     topic = payload.topic.lower().strip()
     mode = payload.mode.lower().strip()
     if topic not in TOPICS:
@@ -815,7 +956,9 @@ def api_random_question(
     mode: str = Query(...),
     position: int = Query(default=0, ge=0),
     db: Session = Depends(get_db),
+    user: User = Depends(current_user),
 ) -> dict[str, Any]:
+    _ = user
     topic = topic.lower().strip()
     mode = mode.lower().strip()
     if topic not in TOPICS:
@@ -831,7 +974,14 @@ def api_random_question(
 
 
 @app.post("/api/attempts/submit")
-def api_submit_attempt(payload: SubmitAttemptRequest, db: Session = Depends(get_db)) -> dict[str, Any]:
+def api_submit_attempt(
+    payload: SubmitAttemptRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+) -> dict[str, Any]:
+    verify_payload_user(payload.user_id, user)
+    rate_limit_request(request, user)
     topic = payload.topic.lower().strip()
     mode = payload.mode.lower().strip()
     if topic not in TOPICS or mode not in MODES:
@@ -878,18 +1028,32 @@ def api_submit_attempt(payload: SubmitAttemptRequest, db: Session = Depends(get_
 
 
 @app.get("/api/chat/history")
-def api_chat_history(user_id: str = Query(...), db: Session = Depends(get_db)) -> dict[str, Any]:
+def api_chat_history(
+    user_id: str = Query(...),
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+) -> dict[str, Any]:
+    verify_payload_user(user_id, user)
     return {"history": chat_history(db, user_id)}
 
 
 @app.post("/api/chat")
-def api_chat(payload: ChatRequest, db: Session = Depends(get_db)) -> dict[str, Any]:
+def api_chat(
+    payload: ChatRequest,
+    request: Request,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+) -> dict[str, Any]:
+    verify_payload_user(payload.user_id, user)
+    rate_limit_request(request, user)
     message = payload.message.strip()
     if not message:
         raise HTTPException(status_code=400, detail="Message is required")
 
     answer, related_suggestions, provider_used = generate_chat_completion(payload, db)
     save_chat_log(db, payload.user_id, message, answer, related_suggestions, provider_used)
+    background_tasks.add_task(log_chat_created, payload.user_id, provider_used)
     return {
         "answer": answer,
         "related_suggestions": related_suggestions,
@@ -898,13 +1062,22 @@ def api_chat(payload: ChatRequest, db: Session = Depends(get_db)) -> dict[str, A
 
 
 @app.post("/api/chat/stream")
-def api_chat_stream(payload: ChatRequest, db: Session = Depends(get_db)) -> StreamingResponse:
+def api_chat_stream(
+    payload: ChatRequest,
+    request: Request,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+) -> StreamingResponse:
+    verify_payload_user(payload.user_id, user)
+    rate_limit_request(request, user)
     message = payload.message.strip()
     if not message:
         raise HTTPException(status_code=400, detail="Message is required")
 
     answer, related_suggestions, provider_used = generate_chat_completion(payload, db)
     save_chat_log(db, payload.user_id, message, answer, related_suggestions, provider_used)
+    background_tasks.add_task(log_chat_created, payload.user_id, provider_used)
 
     def stream():
         for chunk in iter_answer_chunks(answer):
@@ -922,7 +1095,12 @@ def api_chat_stream(payload: ChatRequest, db: Session = Depends(get_db)) -> Stre
 
 
 @app.post("/api/chat/clear")
-def api_chat_clear(payload: ClearChatRequest, db: Session = Depends(get_db)) -> dict[str, bool]:
+def api_chat_clear(
+    payload: ClearChatRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+) -> dict[str, bool]:
+    verify_payload_user(payload.user_id, user)
     clear_chat_history(db, payload.user_id)
     return {"ok": True}
 

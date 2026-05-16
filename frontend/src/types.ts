@@ -1,6 +1,9 @@
 export interface AuthUser {
   user_id: string;
   username: string;
+  role: string;
+  access_token: string;
+  token_type: string;
 }
 
 export interface TopicMeta {
@@ -15,6 +18,7 @@ export type ModeMap = Record<string, string>;
 export interface StatusResponse {
   database: string;
   database_url: string;
+  cache: string;
   providers: Record<string, boolean>;
   default_provider: string;
   frontend_built: boolean;

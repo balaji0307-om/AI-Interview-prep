@@ -17,11 +17,28 @@ function apiUrl(path: string): string {
   return `${API_BASE_URL}${path}`;
 }
 
+function accessToken(): string {
+  try {
+    const raw = localStorage.getItem("interview-prep-ai-store");
+    if (!raw) return "";
+    const parsed = JSON.parse(raw);
+    return parsed?.state?.authUser?.access_token ?? "";
+  } catch {
+    return "";
+  }
+}
+
+function authHeaders(): Record<string, string> {
+  const token = accessToken();
+  return token ? { Authorization: `Bearer ${token}` } : {};
+}
+
 async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(apiUrl(path), {
     ...init,
     headers: {
       "Content-Type": "application/json",
+      ...authHeaders(),
       ...(init?.headers ?? {}),
     },
   });
@@ -105,6 +122,7 @@ export async function streamChatResponse(
     method: "POST",
     headers: {
       "Content-Type": "application/json",
+      ...authHeaders(),
     },
     body: JSON.stringify(payload),
   });
