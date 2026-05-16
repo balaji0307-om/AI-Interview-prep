@@ -19,6 +19,8 @@ export interface StatusResponse {
   database: string;
   database_url: string;
   cache: string;
+  queue: string;
+  vector_backend: string;
   providers: Record<string, boolean>;
   default_provider: string;
   frontend_built: boolean;

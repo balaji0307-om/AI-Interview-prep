@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Query, Request
+from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from pydantic import BaseModel, Field
@@ -19,11 +19,12 @@ from sqlalchemy.orm import Session
 
 from cache import cache_backend_name, cache_get, cache_set, rate_limit_allowed
 from database import Base, SessionLocal, database_label, engine, get_db
+from job_queue import enqueue, queue_backend_name
 from llm_provider import LLMUnavailableError, default_provider_name, generate_text, provider_status
 from models import Attempt, ChatLog, Question, User
 from observability import ObservabilityMiddleware, logger, metrics_snapshot
 from question_bank import QUESTION_BANK_SIZE, build_coding_questions, build_mcq_questions, extract_question_sequence
-from rag_store import RagDocument, index_documents, search as rag_search
+from rag_store import RagDocument, index_document_payloads, index_documents, search as rag_search, vector_backend_name
 from security import TokenError, create_access_token, decode_access_token
 
 
@@ -157,6 +158,21 @@ def current_user(
     if not authorization.lower().startswith("bearer "):
         raise HTTPException(status_code=401, detail="Missing bearer token.")
     token = authorization.split(" ", 1)[1].strip()
+    try:
+        payload = decode_access_token(token)
+    except TokenError as exc:
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
+
+    user_id = str(payload.get("sub", ""))
+    if not user_id.isdigit():
+        raise HTTPException(status_code=401, detail="Invalid token subject.")
+    user = db.get(User, int(user_id))
+    if not user:
+        raise HTTPException(status_code=401, detail="User not found.")
+    return user
+
+
+def user_from_token(db: Session, token: str) -> User:
     try:
         payload = decode_access_token(token)
     except TokenError as exc:
@@ -750,7 +766,7 @@ def generate_chat_completion(payload: ChatRequest, db: Session) -> tuple[str, li
         if a:
             recent_chat_lines.append(f"- Assistant: {a[:220]}")
 
-    rag_lines = [f"- {document.text[:260]}" for document in rag_search(primary_message or message, limit=3)]
+    rag_lines = [f"- {document.text[:260]}" for document in rag_search(primary_message or message, limit=3, user_id=payload.user_id)]
 
     if prefer_local_chat_answer(message):
         answer = build_local_structured_answer(primary_message)
@@ -861,6 +877,8 @@ def api_status() -> dict[str, Any]:
         "database": database_label(),
         "database_url": engine.url.render_as_string(hide_password=True),
         "cache": cache_backend_name(),
+        "queue": queue_backend_name(),
+        "vector_backend": vector_backend_name(),
         "providers": provider_status(),
         "default_provider": default_provider_name(),
         "frontend_built": (FRONTEND_DIST_DIR / "index.html").exists(),
@@ -888,16 +906,23 @@ def api_me(user: User = Depends(current_user)) -> dict[str, str]:
 
 
 @app.post("/api/rag/index")
-def api_rag_index(payload: RagIndexRequest, _: User = Depends(require_admin)) -> dict[str, int]:
-    documents = [
-        RagDocument(
-            id=f"{payload.source}:{hashlib.sha256(document.encode('utf-8')).hexdigest()}",
-            text=document,
-            metadata={"source": payload.source},
-        )
+def api_rag_index(
+    payload: RagIndexRequest,
+    background_tasks: BackgroundTasks,
+    user: User = Depends(require_admin),
+) -> dict[str, int | bool | str]:
+    document_payloads = [
+        {
+            "id": f"{payload.source}:{hashlib.sha256(document.encode('utf-8')).hexdigest()}",
+            "text": document,
+            "metadata": {"source": payload.source, "user_id": "public", "indexed_by": str(user.id)},
+        }
         for document in payload.documents
     ]
-    return {"indexed": index_documents(documents)}
+    if enqueue(index_document_payloads, document_payloads):
+        return {"indexed": 0, "queued": True, "backend": queue_backend_name()}
+    background_tasks.add_task(index_document_payloads, document_payloads)
+    return {"indexed": len(document_payloads), "queued": True, "backend": queue_backend_name()}
 
 
 @app.post("/api/auth/signup")
@@ -1103,6 +1128,57 @@ def api_chat_clear(
     verify_payload_user(payload.user_id, user)
     clear_chat_history(db, payload.user_id)
     return {"ok": True}
+
+
+@app.websocket("/ws/chat")
+async def websocket_chat(websocket: WebSocket) -> None:
+    token = websocket.query_params.get("token", "")
+    db = SessionLocal()
+    try:
+        try:
+            user = user_from_token(db, token)
+        except HTTPException:
+            await websocket.close(code=4401)
+            return
+
+        await websocket.accept()
+        while True:
+            try:
+                data = await websocket.receive_json()
+            except WebSocketDisconnect:
+                break
+
+            message = str(data.get("message", "")).strip()
+            if not message:
+                await websocket.send_json({"type": "error", "message": "Message is required"})
+                continue
+            if not rate_limit_allowed(f"user:{user.id}"):
+                await websocket.send_json({"type": "error", "message": "Rate limit exceeded. Try again soon."})
+                continue
+
+            payload = ChatRequest(
+                user_id=str(user.id),
+                message=message,
+                topic=data.get("topic"),
+                mode=data.get("mode"),
+                provider=data.get("provider"),
+            )
+            answer, related_suggestions, provider_used = generate_chat_completion(payload, db)
+            save_chat_log(db, str(user.id), message, answer, related_suggestions, provider_used)
+            log_chat_created(str(user.id), provider_used)
+
+            for chunk in iter_answer_chunks(answer):
+                await websocket.send_json({"type": "token", "value": chunk})
+            await websocket.send_json(
+                {
+                    "type": "done",
+                    "answer": answer,
+                    "related_suggestions": related_suggestions,
+                    "provider": provider_used,
+                }
+            )
+    finally:
+        db.close()
 
 
 def serve_frontend_asset(full_path: str) -> FileResponse | HTMLResponse:

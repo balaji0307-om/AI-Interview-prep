@@ -33,6 +33,13 @@ function authHeaders(): Record<string, string> {
   return token ? { Authorization: `Bearer ${token}` } : {};
 }
 
+function wsUrl(path: string): string {
+  const base = API_BASE_URL || window.location.origin;
+  const url = new URL(path, base);
+  url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+  return url.toString();
+}
+
 async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(apiUrl(path), {
     ...init,
@@ -169,4 +176,30 @@ export async function streamChatResponse(
   if (buffer.trim()) {
     processLine(buffer);
   }
+}
+
+export function openChatWebSocket(callbacks: {
+  onToken?: (value: string) => void;
+  onDone?: (event: ChatStreamDoneEvent) => void;
+  onError?: (message: string) => void;
+}): WebSocket {
+  const token = accessToken();
+  const url = new URL(wsUrl("/ws/chat"));
+  if (token) {
+    url.searchParams.set("token", token);
+  }
+  const socket = new WebSocket(url);
+  socket.addEventListener("message", (event) => {
+    const data = JSON.parse(event.data) as ChatStreamEvent;
+    if (data.type === "token") {
+      callbacks.onToken?.(data.value);
+      return;
+    }
+    if (data.type === "done") {
+      callbacks.onDone?.(data);
+      return;
+    }
+    callbacks.onError?.(data.message);
+  });
+  return socket;
 }
